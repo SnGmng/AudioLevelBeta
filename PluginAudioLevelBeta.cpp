@@ -172,7 +172,7 @@ struct Measure
 		m_gainPeak(1.0),
 		m_freqMin(20.0),
 		m_freqMax(20000.0),
-		m_sensitivity(35.0),
+		m_sensitivity(0.0),
 		m_parent(NULL),
 		m_skin(NULL),
 		m_rmName(NULL),
@@ -207,15 +207,15 @@ struct Measure
 		m_kPeak[1] = 0.0f;
 		m_kFFT[0] = 0.0f;
 		m_kFFT[1] = 0.0f;
+		m_fftCfg = NULL;
+		m_fftIn = NULL;
+		m_fftOut = NULL;
+		m_bandOut = NULL;
 
 		for (int iChan = 0; iChan < MAX_CHANNELS; ++iChan)
 		{
 			m_rms[iChan] = 0.0;
 			m_peak[iChan] = 0.0;
-			m_fftCfg = NULL;
-			m_fftIn = NULL;
-			m_fftOut = NULL;
-			m_bandOut = NULL;
 		}
 	}
 
@@ -485,7 +485,9 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 		// (re)parse gain constants
 		m->m_gainRMS = max(0.0, RmReadDouble(rm, L"RMSGain", m->m_gainRMS));
 		m->m_gainPeak = max(0.0, RmReadDouble(rm, L"PeakGain", m->m_gainPeak));
-		m->m_sensitivity = max(1.0, RmReadDouble(rm, L"Sensitivity", m->m_sensitivity));
+
+		m->m_sensitivity = 10 * log10(m->m_fftSize);	// default dynamic range/noise floor
+		m->m_sensitivity = 10 / max(1.0, RmReadDouble(rm, L"Sensitivity", m->m_sensitivity));
 
 		// regenerate filter constants
 		if (m->m_wfx)
@@ -716,7 +718,7 @@ PLUGIN_EXPORT double Update(void* data)
 				int iBand = 0;
 				float f0 = 0.0f;
 
-				while (iBin <= (m->m_fftBufferSize / 2) && iBand < m->m_nBands)
+				while (iBin <= (m->m_fftBufferSize * 0.5) && iBand < m->m_nBands)
 				{
 					const float fLin1 = ((float)iBin + 0.5f) * df;
 					const float fLog1 = m->m_bandFreq[iBand];
@@ -777,17 +779,17 @@ PLUGIN_EXPORT double Update(void* data)
 	case Measure::TYPE_BAND:
 		if (parent->m_clCapture && parent->m_nBands)
 		{
-			return max(0, 10.0 / parent->m_sensitivity * log10(CLAMP01(parent->m_bandOut[m->m_bandIdx])) + 1.0);
+			return max(0, parent->m_sensitivity * log10(CLAMP01(parent->m_bandOut[m->m_bandIdx])) + 1.0);
 		}
 		break;
 	case Measure::TYPE_FFT:
 		if (parent->m_clCapture && parent->m_fftBufferSize)
 		{
-			return max(0, 10.0 / parent->m_sensitivity * log10(CLAMP01(parent->m_fftOut[m->m_fftIdx])) + 1.0);
+			return max(0, parent->m_sensitivity * log10(CLAMP01(parent->m_fftOut[m->m_fftIdx])) + 1.0);
 		}
 		break;
 	case Measure::TYPE_FFTFREQ:
-		if (parent->m_clCapture && parent->m_fftBufferSize && m->m_fftIdx <= (parent->m_fftBufferSize / 2))
+		if (parent->m_clCapture && parent->m_fftBufferSize && m->m_fftIdx <= (parent->m_fftBufferSize * 0.5))
 		{
 			return (m->m_fftIdx * m->m_wfx->nSamplesPerSec / parent->m_fftBufferSize);
 		}
