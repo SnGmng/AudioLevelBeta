@@ -13,12 +13,13 @@
 #include <FunctionDiscoveryKeys_devpkey.h>
 #include <VersionHelpers.h>
 
-//#include <avrt.h>
-//#pragma comment(lib, "Avrt.lib")
-
 #include <cmath>
 #include <cassert>
 #include <vector>
+
+#include <thread>
+#include <avrt.h>
+#pragma comment(lib, "Avrt.lib")
 
 #include "../API/RainmeterAPI.h"
 
@@ -54,6 +55,7 @@ Channel=R
 #define EXIT_ON_ERROR(hres)		if (FAILED(hres)) { goto Exit; }
 #define SAFE_RELEASE(p)			if ((p) != NULL) { (p)->Release(); (p) = NULL; }
 #define CLAMP01(x)				max(0.0, min(1.0, (x)))
+#define MSG_UPDATE				L"!UpdateMeasure Audio"
 
 struct Measure
 {
@@ -136,16 +138,19 @@ struct Measure
 	WAVEFORMATEX*			m_wfx;						// audio format info
 	IAudioClient*			m_clAudio;					// audio client instance
 	IAudioCaptureClient*	m_clCapture;				// capture client instance
+	IAudioClient*			m_clBugAudio;				// audio client for loopback events
 #if (WINDOWS_BUG_WORKAROUND)
-	IAudioClient*			m_clBugAudio;				// audio client for dummy silent channel
 	IAudioRenderClient*		m_clBugRender;				// render client for dummy silent channel
 #endif
-														//HANDLE				m_hTask;					// Multimedia Class Scheduler Service task
+	HANDLE					m_hReadyEvent;				// buffer-event handle to receive notifications
+	HANDLE					m_hStopEvent;				// skin closed handle to receive notifications
+	HANDLE					m_hTask;					// Multimedia Class Scheduler Service task
 	WCHAR					m_reqID[64];				// requested device ID (parsed from options)
 	WCHAR					m_devName[64];				// device friendly name (detected in init)
 	float					m_kRMS[2];					// RMS attack/decay filter constants
 	float					m_kPeak[2];					// peak attack/decay filter constants
 	float					m_kFFT[2];					// FFT attack/decay filter constants
+	BYTE*					m_bufChunk;					// buffer for latest data chunk copy
 	double					m_rms[MAX_CHANNELS];		// current RMS levels
 	double					m_peak[MAX_CHANNELS];		// current peak levels
 	kiss_fftr_cfg			m_fftCfg;					// FFT states for each channel
@@ -182,11 +187,13 @@ struct Measure
 		m_wfx(NULL),
 		m_clAudio(NULL),
 		m_clCapture(NULL),
-#if (WINDOWS_BUG_WORKAROUND)
 		m_clBugAudio(NULL),
+#if (WINDOWS_BUG_WORKAROUND)
 		m_clBugRender(NULL),
 #endif
-		//m_hTask(NULL),
+		m_hReadyEvent(NULL),
+		m_hStopEvent(NULL),
+		m_hTask(NULL),
 		m_fftKWdw(NULL),
 		m_fftTmpIn(NULL),
 		m_fftTmpOut(NULL),
@@ -208,6 +215,7 @@ struct Measure
 		m_kFFT[0] = 0.0f;
 		m_kFFT[1] = 0.0f;
 		m_fftCfg = NULL;
+		m_bufChunk = NULL;
 		m_fftIn = NULL;
 		m_fftOut = NULL;
 		m_bandOut = NULL;
@@ -221,6 +229,29 @@ struct Measure
 
 	HRESULT DeviceInit();
 	void DeviceRelease();
+
+	void DoCaptureLoop()
+	{
+		// register thread with MMCSS
+		DWORD nTaskIndex = 0;
+		m_hTask = AvSetMmThreadCharacteristics(L"Pro Audio", &nTaskIndex);
+		if (!(m_hTask && AvSetMmThreadPriority(m_hTask, AVRT_PRIORITY_CRITICAL)))
+		{
+			DWORD dwErr = GetLastError();
+			RmLog(LOG_WARNING, L"Failed to start multimedia task.");
+			return;
+		}
+
+		HANDLE waitArray[2] = { m_hReadyEvent, m_hStopEvent };
+		
+		while (1)
+		{
+			if (WAIT_OBJECT_0 != WaitForMultipleObjects(ARRAYSIZE(waitArray), waitArray, FALSE, INFINITE))
+				return;
+
+			RmExecute(m_skin, MSG_UPDATE);
+		}
+	};
 };
 
 float df, fftScalar, bandScalar;
@@ -261,6 +292,7 @@ PLUGIN_EXPORT void Initialize(void** data, void* rm)
 				!(*iter)->m_parent)
 			{
 				m->m_parent = (*iter);
+
 				return;
 			}
 		}
@@ -369,8 +401,14 @@ PLUGIN_EXPORT void Initialize(void** data, void* rm)
 	// create the enumerator
 	if (CoCreateInstance(CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, IID_IMMDeviceEnumerator, (void**)&m->m_enum) == S_OK)
 	{
-		// init the device (ok if it fails - it'll keep checking during Update)
-		m->DeviceInit();
+		// init the device (if it fails, log debug message and quit)
+		if (m->DeviceInit() == S_OK)
+		{
+			// create separate thread with event-driven update loop
+			std::thread thread(&Measure::DoCaptureLoop, m);
+			thread.detach();
+		}
+
 		return;
 	}
 
@@ -386,6 +424,8 @@ PLUGIN_EXPORT void Initialize(void** data, void* rm)
 PLUGIN_EXPORT void Finalize(void* data)
 {
 	Measure* m = (Measure*)data;
+
+	SetEvent(m->m_hStopEvent);
 
 	m->DeviceRelease();
 	SAFE_RELEASE(m->m_enum);
@@ -528,10 +568,11 @@ PLUGIN_EXPORT double Update(void* data)
 		HRESULT hr = m->m_clCapture->GetNextPacketSize(&nFramesNext);
 		if (hr == S_OK && nFramesNext > 0)
 		{
-			// retrieve and copy buffer data
 			while (m->m_clCapture->GetBuffer(&buffer, &nFrames, &flags, NULL, NULL) == S_OK)
 			{
-				// release buffer to engine immediately to resume capture
+				memcpy(&m->m_bufChunk[0], &buffer[0], nFrames * m->m_wfx->nBlockAlign);
+
+				// release buffer immediately to resume capture
 				m->m_clCapture->ReleaseBuffer(nFrames);
 
 				// test for discontinuity or silence
@@ -651,11 +692,11 @@ PLUGIN_EXPORT double Update(void* data)
 						}
 					}
 
-					// fill ring buffers (demux streams) for FFT
+					// store data in ring buffers, and demux streams for FFT
 					if (m->m_fftSize)
 					{
-						float* sF32 = (float*)buffer;
-						INT16* sI16 = (INT16*)buffer;
+						float* sF32 = (float*)m->m_bufChunk;
+						INT16* sI16 = (INT16*)m->m_bufChunk;
 
 						for (int iFrame = 0; iFrame < nFrames; ++iFrame)
 						{
@@ -684,6 +725,7 @@ PLUGIN_EXPORT double Update(void* data)
 						}
 					}
 				}
+				//else RmLog(LOG_WARNING, L"Silence or discontinuity detected.");
 			}
 
 			// process FFTs
@@ -766,13 +808,6 @@ PLUGIN_EXPORT double Update(void* data)
 			m->m_peak[iChan] = 0.0;
 		}
 	}
-	else if (!m->m_parent && !m->m_clCapture)
-	{
-		// poll for new devices
-		assert(m->m_enum);
-		assert(!m->m_dev);
-		m->DeviceInit();
-	}
 
 	switch (m->m_type)
 	{
@@ -835,6 +870,14 @@ PLUGIN_EXPORT double Update(void* data)
 	}
 
 	return 0.0;
+}
+
+
+/**
+* Indicates that the application working directory will not be reset by the plugin.
+*/
+PLUGIN_EXPORT void OverrideDirectory()
+{
 }
 
 
@@ -935,14 +978,6 @@ PLUGIN_EXPORT LPCWSTR GetString(void* data)
 
 
 /**
-* Indicates that the application working directory will not be reset by the plugin.
-*/
-PLUGIN_EXPORT void OverrideDirectory()
-{
-}
-
-
-/**
 * Try to initialize the default device for the specified port.
 *
 * @return		Result value, S_OK on success.
@@ -991,14 +1026,12 @@ HRESULT	Measure::DeviceInit()
 
 	SAFE_RELEASE(props);
 
-#if (WINDOWS_BUG_WORKAROUND)
-	// get an extra audio client for the dummy silent channel
+	// get an extra audio client for loopback events
 	hr = m_dev->Activate(IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&m_clBugAudio);
 	if (hr != S_OK)
 	{
-		RmLog(LOG_WARNING, L"Failed to create audio client for Windows bug workaround.");
+		RmLog(LOG_WARNING, L"Failed to create audio client for loopback events.");
 	}
-#endif
 
 	// get the main audio client
 	//if (m_dev->Activate(IID_IAudioClient3, CLSCTX_ALL, NULL, (void**)&m_clAudio) != S_OK)
@@ -1102,39 +1135,61 @@ HRESULT	Measure::DeviceInit()
 		m_bandOut = (float*)calloc(m_nBands * sizeof(float), 1);
 	}
 
+	hr = m_clBugAudio->Initialize(
+		AUDCLNT_SHAREMODE_SHARED,
+		AUDCLNT_STREAMFLAGS_EVENTCALLBACK,		// "Each time the client receives an event for the render stream, it must signal the capture client to run"
+		0,
+		0,
+		m_wfx,
+		NULL);
+	if (hr != S_OK)
+	{
+		RmLog(LOG_WARNING, L"Failed to initialize audio client for loopback events.");
+	}
+	EXIT_ON_ERROR(hr);
+
+	m_hReadyEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+	if (m_hReadyEvent == NULL)
+	{
+		RmLog(LOG_WARNING, L"Failed to create buffer-event handle.");
+		hr = E_FAIL;
+		goto Exit;
+	}
+
+	m_hStopEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+
+	hr = m_clBugAudio->SetEventHandle(m_hReadyEvent);
+	EXIT_ON_ERROR(hr);
+
 #if (WINDOWS_BUG_WORKAROUND)
 	// ---------------------------------------------------------------------------------------
 	// Windows bug workaround: create a silent render client before initializing loopback mode
 	// see: http://social.msdn.microsoft.com/Forums/windowsdesktop/en-US/c7ba0a04-46ce-43ff-ad15-ce8932c00171/loopback-recording-causes-digital-stuttering?forum=windowspro-audiodevelopment
 	if (m_port == PORT_OUTPUT)
 	{
-		hr = m_clBugAudio->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, m_wfx, NULL);
+		hr = m_clBugAudio->GetService(IID_IAudioRenderClient, (void**)&m_clBugRender);
 		EXIT_ON_ERROR(hr);
 
-		// get the frame count
 		UINT32 nFrames;
 		hr = m_clBugAudio->GetBufferSize(&nFrames);
 		EXIT_ON_ERROR(hr);
 
-		// create a render client
-		hr = m_clBugAudio->GetService(IID_IAudioRenderClient, (void**)&m_clBugRender);
-		EXIT_ON_ERROR(hr);
-
-		// get the buffer
 		BYTE* buffer;
 		hr = m_clBugRender->GetBuffer(nFrames, &buffer);
 		EXIT_ON_ERROR(hr);
 
-		// release it
 		hr = m_clBugRender->ReleaseBuffer(nFrames, AUDCLNT_BUFFERFLAGS_SILENT);
-		EXIT_ON_ERROR(hr);
-
-		// start the stream
-		hr = m_clBugAudio->Start();
 		EXIT_ON_ERROR(hr);
 	}
 	// ---------------------------------------------------------------------------------------
 #endif
+
+	hr = m_clBugAudio->Start();
+	if (hr != S_OK)
+	{
+		RmLog(LOG_WARNING, L"Failed to start the stream for loopback events.");
+	}
+	EXIT_ON_ERROR(hr);
 
 	// initialize the audio client
 
@@ -1167,10 +1222,15 @@ HRESULT	Measure::DeviceInit()
 	}
 	} else */
 
-	if (m_clAudio->Initialize(AUDCLNT_SHAREMODE_SHARED, (m_port == PORT_OUTPUT ? AUDCLNT_STREAMFLAGS_LOOPBACK : 0)
-		, 0, 0, m_wfx, NULL) != S_OK)
+	if (m_clAudio->Initialize(
+		AUDCLNT_SHAREMODE_SHARED,
+		(m_port == PORT_OUTPUT ? AUDCLNT_STREAMFLAGS_LOOPBACK : 0),
+		0,
+		0,
+		m_wfx,
+		NULL) != S_OK)
 	{
-		RmLog(LOG_WARNING, L"Failed to initialize audio client.");
+		RmLog(LOG_WARNING, L"Failed to initialize loopback audio client.");
 		goto Exit;
 	}
 
@@ -1182,17 +1242,6 @@ HRESULT	Measure::DeviceInit()
 	}
 	EXIT_ON_ERROR(hr);
 
-	// register with MMCSS
-	// 0x80070610 ERROR_THREAD_ALREADY_IN_TASK (1552)
-	/*DWORD nTaskIndex = 0;
-	m_hTask = AvSetMmThreadCharacteristics(L"Pro Audio", &nTaskIndex);
-	if (!(m_hTask && AvSetMmThreadPriority(m_hTask, AVRT_PRIORITY_CRITICAL)))
-	{
-	DWORD dwErr = GetLastError();
-	RmLog(LOG_WARNING, L"Failed to start multimedia task.");
-	goto Exit;
-	}*/
-
 	// start the stream
 	hr = m_clAudio->Start();
 	if (hr != S_OK)
@@ -1201,6 +1250,17 @@ HRESULT	Measure::DeviceInit()
 	}
 	EXIT_ON_ERROR(hr);
 
+	// allocate buffer for latest data chunk copy
+	UINT32 nMaxFrames;
+	hr = m_clAudio->GetBufferSize(&nMaxFrames);
+	if (hr != S_OK)
+	{
+		RmLog(LOG_WARNING, L"Failed to determine max buffer size.");
+	}
+	EXIT_ON_ERROR(hr);
+	
+	m_bufChunk = (BYTE*)calloc(nMaxFrames * m_wfx->nBlockAlign * sizeof(BYTE), 1);
+
 	return S_OK;
 
 Exit:
@@ -1208,20 +1268,22 @@ Exit:
 	return hr;
 }
 
+
 /**
 * Release handles to audio resources.  (except the enumerator)
 */
 void Measure::DeviceRelease()
 {
-#if (WINDOWS_BUG_WORKAROUND)
+
 	RmLog(LOG_DEBUG, L"Releasing dummy stream audio device.");
 	if (m_clBugAudio)
 	{
 		m_clBugAudio->Stop();
 	}
+#if (WINDOWS_BUG_WORKAROUND)
 	SAFE_RELEASE(m_clBugRender);
-	SAFE_RELEASE(m_clBugAudio);
 #endif
+	SAFE_RELEASE(m_clBugAudio);
 
 	RmLog(LOG_DEBUG, L"Releasing audio device.");
 
@@ -1234,10 +1296,15 @@ void Measure::DeviceRelease()
 	SAFE_RELEASE(m_clAudio);
 	SAFE_RELEASE(m_dev);
 
+	if (m_hReadyEvent != NULL) { CloseHandle(m_hReadyEvent); }
+	if (m_hStopEvent != NULL) { CloseHandle(m_hStopEvent); }
 	//if (m_hTask != NULL) { AvRevertMmThreadCharacteristics(m_hTask); }
 
 	if (m_fftCfg) kiss_fftr_free(m_fftCfg);
 	m_fftCfg = NULL;
+
+	if (m_bufChunk) free(m_bufChunk);
+	m_bufChunk = NULL;
 
 	if (m_fftIn) free(m_fftIn);
 	m_fftIn = NULL;
