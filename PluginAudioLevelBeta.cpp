@@ -124,6 +124,7 @@ struct Measure
 	int						m_fftIdx;					// FFT index to retrieve (parsed from options)
 	int						m_nBands;					// number of frequency bands (parsed from options)
 	int						m_bandIdx;					// band index to retrieve (parsed from options)
+	int                     m_smoothing;                // smoothing level (parsed from options)
 	double					m_gainRMS;					// RMS gain (parsed from options)
 	double					m_gainPeak;					// peak gain (parsed from options)
 	double					m_freqMin;					// min freq for band measurement
@@ -162,6 +163,7 @@ struct Measure
 	int						m_fftBufW;					// write index for input ring buffers
 	float*					m_bandFreq;					// buffer of band max frequencies
 	float*					m_bandOut;					// buffer of band values
+	float*                  m_bandTmpOut;               // temp buffer of band values
 
 	Measure() :
 		m_port(PORT_OUTPUT),
@@ -173,6 +175,7 @@ struct Measure
 		m_fftIdx(-1),
 		m_nBands(0),
 		m_bandIdx(-1),
+		m_smoothing(0),
 		m_gainRMS(1.0),
 		m_gainPeak(1.0),
 		m_freqMin(20.0),
@@ -219,6 +222,7 @@ struct Measure
 		m_fftIn = NULL;
 		m_fftOut = NULL;
 		m_bandOut = NULL;
+		m_bandTmpOut = NULL;
 
 		for (int iChan = 0; iChan < MAX_CHANNELS; ++iChan)
 		{
@@ -243,7 +247,7 @@ struct Measure
 		}
 
 		HANDLE waitArray[2] = { m_hReadyEvent, m_hStopEvent };
-		
+
 		while (1)
 		{
 			if (WAIT_OBJECT_0 != WaitForMultipleObjects(ARRAYSIZE(waitArray), waitArray, FALSE, INFINITE))
@@ -254,7 +258,7 @@ struct Measure
 	};
 };
 
-float df, fftScalar, bandScalar;
+float df, fftScalar, bandScalar, smoothingScalar;
 
 const CLSID CLSID_MMDeviceEnumerator = __uuidof(MMDeviceEnumerator);
 const IID IID_IMMDeviceEnumerator = __uuidof(IMMDeviceEnumerator);
@@ -395,9 +399,11 @@ PLUGIN_EXPORT void Initialize(void** data, void* rm)
 		m->m_nBands = 0;
 	}
 
+	// initialize smoothing
+	m->m_smoothing = max(0, RmReadInt(rm, L"Smoothing", m->m_smoothing));
+
 	m->m_freqMin = max(0.0, RmReadDouble(rm, L"FreqMin", m->m_freqMin));
 	m->m_freqMax = max(0.0, RmReadDouble(rm, L"FreqMax", m->m_freqMax));
-
 	// create the enumerator
 	if (CoCreateInstance(CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, IID_IMMDeviceEnumerator, (void**)&m->m_enum) == S_OK)
 	{
@@ -755,7 +761,7 @@ PLUGIN_EXPORT double Update(void* data)
 			// integrate FFT results into log-scale frequency bands
 			if (m->m_nBands)
 			{
-				memset(m->m_bandOut, 0, m->m_nBands * sizeof(float));
+				memset(m->m_bandTmpOut, 0, m->m_nBands * sizeof(float));
 				int iBin = 0;
 				int iBand = 0;
 				float f0 = 0.0f;
@@ -764,7 +770,7 @@ PLUGIN_EXPORT double Update(void* data)
 				{
 					const float fLin1 = ((float)iBin + 0.5f) * df;
 					const float fLog1 = m->m_bandFreq[iBand];
-					float& y = m->m_bandOut[iBand];
+					float& y = m->m_bandTmpOut[iBand];
 
 					if (fLin1 <= fLog1)
 					{
@@ -778,6 +784,23 @@ PLUGIN_EXPORT double Update(void* data)
 						f0 = fLog1;
 						iBand += 1;
 					}
+				}
+
+				// sensivity
+				for (iBand = 0; iBand < m->m_nBands; iBand++)
+				{
+					m->m_bandTmpOut[iBand] = max(0, m->m_sensitivity * log10(CLAMP01(m->m_bandTmpOut[iBand])) + 1.0);
+				}
+
+				// smoothing
+				for (iBand = 0; iBand < m->m_nBands; iBand++) 
+				{
+					float x = 0;
+					for (int s = -m->m_smoothing; s <= m->m_smoothing; s++)
+					{
+						x += m->m_bandTmpOut[(iBand + s <= 0) || (iBand + s >= m->m_nBands) ? iBand : iBand + s];
+					}
+					m->m_bandOut[iBand] = x * smoothingScalar;
 				}
 			}
 		}
@@ -814,7 +837,8 @@ PLUGIN_EXPORT double Update(void* data)
 	case Measure::TYPE_BAND:
 		if (parent->m_clCapture && parent->m_nBands)
 		{
-			return max(0, parent->m_sensitivity * log10(CLAMP01(parent->m_bandOut[m->m_bandIdx])) + 1.0);
+			return parent->m_bandOut[m->m_bandIdx];
+			//max(0, parent->m_sensitivity * log10(CLAMP01(parent->m_bandOut[m->m_bandIdx])) + 1.0);
 		}
 		break;
 	case Measure::TYPE_FFT:
@@ -1126,12 +1150,14 @@ HRESULT	Measure::DeviceInit()
 
 		df = (float)m_wfx->nSamplesPerSec / m_fftBufferSize;
 		bandScalar = 2.0f / (float)m_wfx->nSamplesPerSec;
+		smoothingScalar = (float)(1.0 / ((m_smoothing * 2) + 1));
 
 		for (int iBand = 1; iBand < m_nBands; ++iBand)
 		{
 			m_bandFreq[iBand] = (float)(m_bandFreq[iBand - 1] * pow(2.0, step));
 		}
 
+		m_bandTmpOut = (float*)calloc(m_nBands * sizeof(float), 1);
 		m_bandOut = (float*)calloc(m_nBands * sizeof(float), 1);
 	}
 
@@ -1258,7 +1284,7 @@ HRESULT	Measure::DeviceInit()
 		RmLog(LOG_WARNING, L"Failed to determine max buffer size.");
 	}
 	EXIT_ON_ERROR(hr);
-	
+
 	m_bufChunk = (BYTE*)calloc(nMaxFrames * m_wfx->nBlockAlign * sizeof(BYTE), 1);
 
 	return S_OK;
@@ -1314,6 +1340,9 @@ void Measure::DeviceRelease()
 
 	if (m_bandOut) free(m_bandOut);
 	m_bandOut = NULL;
+
+	if (m_bandTmpOut) free(m_bandTmpOut);
+	m_bandTmpOut = NULL;
 
 	for (int iChan = 0; iChan < Measure::MAX_CHANNELS; ++iChan)
 	{
