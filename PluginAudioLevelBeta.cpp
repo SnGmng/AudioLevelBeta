@@ -762,7 +762,7 @@ PLUGIN_EXPORT double Update(void* data)
 			if (m->m_nBands)
 			{
 				memset(m->m_bandTmpOut, 0, m->m_nBands * sizeof(float));
-				int iBin = 0;
+				int iBin = (int)((m->m_freqMin / df) - 0.5);
 				int iBand = 0;
 				float f0 = 0.0f;
 
@@ -1146,7 +1146,7 @@ HRESULT	Measure::DeviceInit()
 	{
 		m_bandFreq = (float*)malloc(m_nBands * sizeof(float));
 		const double step = (log(m_freqMax / m_freqMin) / m_nBands) / log(2.0);
-		m_bandFreq[0] = (float)(m_freqMin * pow(2.0, step / 2.0));
+		m_bandFreq[0] = (float)(m_freqMin * pow(2.0, step));
 
 		df = (float)m_wfx->nSamplesPerSec / m_fftBufferSize;
 		bandScalar = 2.0f / (float)m_wfx->nSamplesPerSec;
