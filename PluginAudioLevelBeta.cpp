@@ -764,7 +764,7 @@ PLUGIN_EXPORT double Update(void* data)
 				memset(m->m_bandTmpOut, 0, m->m_nBands * sizeof(float));
 				int iBin = (int)((m->m_freqMin / df) - 0.5);
 				int iBand = 0;
-				float f0 = 0.0f;
+				float f0 = m->m_freqMin;
 
 				while (iBin <= (m->m_fftBufferSize * 0.5) && iBand < m->m_nBands)
 				{
