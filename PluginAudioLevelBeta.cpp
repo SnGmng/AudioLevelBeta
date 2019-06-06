@@ -21,7 +21,7 @@
 #include <avrt.h>
 #pragma comment(lib, "Avrt.lib")
 
-#include "../API/RainmeterAPI.h"
+#include "../../API/RainmeterAPI.h"
 
 #include "kiss_fft130/kiss_fftr.h"
 
@@ -87,6 +87,7 @@ struct Measure
 		TYPE_BAND,
 		TYPE_FFTFREQ,
 		TYPE_BANDFREQ,
+		TYPE_WAVE,
 		TYPE_FORMAT,
 		TYPE_DEV_STATUS,
 		TYPE_DEV_NAME,
@@ -106,6 +107,15 @@ struct Measure
 		NUM_FORMATS
 	};
 
+	enum BandType
+	{
+		BNDTYPE_FFT,
+		BNDTYPE_WAVE,
+		BNDTYPE_ALL,
+		// ... //
+		NUM_BAND_TYPES
+	};
+
 	struct BandInfo
 	{
 		float freq;
@@ -116,6 +126,7 @@ struct Measure
 	Channel					m_channel;					// channel specifier (parsed from options)
 	Type					m_type;						// data type specifier (parsed from options)
 	Format					m_format;					// format specifier (detected in init)
+	BandType				m_bndType;					// band type specifier (parsed from options)
 	int						m_envRMS[2];				// RMS attack/decay times in ms (parsed from options)
 	int						m_envPeak[2];				// peak attack/decay times in ms (parsed from options)
 	int						m_envFFT[2];				// FFT attack/decay times in ms (parsed from options)
@@ -164,12 +175,16 @@ struct Measure
 	float*					m_bandFreq;					// buffer of band max frequencies
 	float*					m_bandOut;					// buffer of band values
 	float*                  m_bandTmpOut;               // temp buffer of band values
+	float*                  m_waveOut;					// buffer of wave values
+	float*					m_waveTmpOut;				// temp buffer of wave values
+	float*					m_waveTmpOut2;				// 2nd temp buffer of wave values
 
 	Measure() :
 		m_port(PORT_OUTPUT),
 		m_channel(CHANNEL_SUM),
 		m_type(TYPE_RMS),
 		m_format(FMT_INVALID),
+		m_bndType(BNDTYPE_FFT),
 		m_fftSize(0),
 		m_fftBufferSize(0),
 		m_fftIdx(-1),
@@ -223,6 +238,9 @@ struct Measure
 		m_fftOut = NULL;
 		m_bandOut = NULL;
 		m_bandTmpOut = NULL;
+		m_waveOut = NULL;
+		m_waveTmpOut = NULL;
+		m_waveTmpOut2 = NULL;
 
 		for (int iChan = 0; iChan < MAX_CHANNELS; ++iChan)
 		{
@@ -258,7 +276,7 @@ struct Measure
 	};
 };
 
-float df, fftScalar, bandScalar, smoothingScalar;
+float df, dw, fftScalar, bandScalar, smoothingScalar, waveScalar;
 
 const CLSID CLSID_MMDeviceEnumerator = __uuidof(MMDeviceEnumerator);
 const IID IID_IMMDeviceEnumerator = __uuidof(IMMDeviceEnumerator);
@@ -381,6 +399,28 @@ PLUGIN_EXPORT void Initialize(void** data, void* rm)
 		}
 	}
 
+	// parse band type specifier
+	LPCWSTR bndType = RmReadString(rm, L"BandType", L"");
+	if (bndType && *bndType)
+	{
+		if (_wcsicmp(bndType, L"FFT") == 0)
+		{
+			m->m_bndType = Measure::BNDTYPE_FFT;
+		}
+		else if (_wcsicmp(bndType, L"Wave") == 0)
+		{
+			m->m_bndType = Measure::BNDTYPE_WAVE;
+		}
+		else if (_wcsicmp(bndType, L"All") == 0)
+		{
+			m->m_bndType = Measure::BNDTYPE_ALL;
+		}
+		else
+		{
+			RmLogF(rm, LOG_ERROR, L"Invalid Band Type '%s', must be one of: FFT or Wave or All.", bndType);
+		}
+	}
+
 	// initialize FFT data
 	m->m_fftSize = RmReadInt(rm, L"FFTSize", m->m_fftSize);
 	if (m->m_fftSize < 0 || m->m_fftSize & 1)
@@ -463,6 +503,7 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 		L"Band",							// TYPE_BAND
 		L"FFTFreq",							// TYPE_FFTFREQ
 		L"BandFreq",						// TYPE_BANDFREQ
+		L"Wave",							// TYPE_WAVE
 		L"Format",							// TYPE_FORMAT
 		L"DeviceStatus",					// TYPE_DEV_STATUS
 		L"DeviceName",						// TYPE_DEV_NAME
@@ -741,66 +782,119 @@ PLUGIN_EXPORT double Update(void* data)
 				memcpy(&m->m_fftTmpIn[0], &m->m_fftIn[m->m_fftBufW], (m->m_fftSize - m->m_fftBufW) * sizeof(float));
 				memcpy(&m->m_fftTmpIn[m->m_fftSize - m->m_fftBufW], &m->m_fftIn[0], m->m_fftBufW * sizeof(float));
 
-				// apply the windowing function
-				for (int iBin = 0; iBin < m->m_fftSize; ++iBin)
-					m->m_fftTmpIn[iBin] *= m->m_fftKWdw[iBin];
-
-				kiss_fftr(m->m_fftCfg, m->m_fftTmpIn, m->m_fftTmpOut);
-
-				for (int iBin = 0; iBin < m->m_fftBufferSize; ++iBin)
+				if (m->m_bndType == Measure::BNDTYPE_WAVE || m->m_bndType == Measure::BNDTYPE_ALL)
 				{
-					// old and new values
-					float x0 = m->m_fftOut[iBin];
-					const float x1 = (m->m_fftTmpOut[iBin].r * m->m_fftTmpOut[iBin].r + m->m_fftTmpOut[iBin].i * m->m_fftTmpOut[iBin].i) * fftScalar;
+					// copy waveform into wave output buffer
+					memcpy(&m->m_waveTmpOut[0], &m->m_fftTmpIn[0], m->m_fftSize * sizeof(float));
+				}
 
-					x0 = x1 + m->m_kFFT[(x1 < x0)] * (x0 - x1);		// attack/decay filter
-					m->m_fftOut[iBin] = x0;
+				if (m->m_bndType == Measure::BNDTYPE_FFT || m->m_bndType == Measure::BNDTYPE_ALL)
+				{
+					// apply the windowing function
+					for (int iBin = 0; iBin < m->m_fftSize; ++iBin)
+						m->m_fftTmpIn[iBin] *= m->m_fftKWdw[iBin];
+
+					kiss_fftr(m->m_fftCfg, m->m_fftTmpIn, m->m_fftTmpOut);
+
+					for (int iBin = 0; iBin < m->m_fftBufferSize; ++iBin)
+					{
+						// old and new values
+						float x0 = m->m_fftOut[iBin];
+						const float x1 = (m->m_fftTmpOut[iBin].r * m->m_fftTmpOut[iBin].r + m->m_fftTmpOut[iBin].i * m->m_fftTmpOut[iBin].i) * fftScalar;
+
+						x0 = x1 + m->m_kFFT[(x1 < x0)] * (x0 - x1);		// attack/decay filter
+						m->m_fftOut[iBin] = x0;
+					}
 				}
 			}
 
-			// integrate FFT results into log-scale frequency bands
 			if (m->m_nBands)
 			{
-				memset(m->m_bandTmpOut, 0, m->m_nBands * sizeof(float));
-				int iBin = (int)((m->m_freqMin / df) - 0.5);
-				int iBand = 0;
-				float f0 = 0.0f;
-
-				while (iBin <= (m->m_fftBufferSize * 0.5) && iBand < m->m_nBands)
+				// integrate waveform into lin-scale frequency bands
+				if (m->m_bndType == Measure::BNDTYPE_WAVE || m->m_bndType == Measure::BNDTYPE_ALL)
 				{
-					const float fLin1 = ((float)iBin + 0.5f) * df;
-					const float fLog1 = m->m_bandFreq[iBand];
-					float& y = m->m_bandTmpOut[iBand];
+					memset(m->m_waveOut, 0, m->m_nBands * sizeof(float));
+					int iBin = 0;
+					int iBand = 0;
+					float w0 = 0.0f;
 
-					if (fLin1 <= fLog1)
+					while (iBin <= m->m_fftSize && iBand < m->m_nBands)
 					{
-						y += (fLin1 - f0) * m->m_fftOut[iBin] * bandScalar;
-						f0 = fLin1;
-						iBin += 1;
+						const float wLin1 = iBin;
+						const float bLin1 = dw * iBand;
+						float& y = m->m_waveTmpOut2[iBand];
+
+						if (wLin1 < bLin1)
+						{
+							y += (wLin1 - w0) * (m->m_waveTmpOut[iBin] + 0.5);
+							w0 = wLin1;
+							iBin += 1;
+						}
+						else
+						{
+							y += (wLin1 - w0) * (m->m_waveTmpOut[iBin] + 0.5);
+							y *= waveScalar;
+							w0 = bLin1;
+							iBand += 1;
+						}
 					}
-					else
+
+					// smoothing
+					for (iBand = 0; iBand < m->m_nBands; iBand++)
 					{
-						y += (fLog1 - f0) * m->m_fftOut[iBin] * bandScalar;
-						f0 = fLog1;
-						iBand += 1;
+						float x = 0;
+						for (int s = -m->m_smoothing; s <= m->m_smoothing; s++)
+						{
+							x += m->m_waveTmpOut2[(iBand + s <= 0) || (iBand + s >= m->m_nBands) ? iBand : iBand + s];
+						}
+						m->m_waveOut[iBand] = x * smoothingScalar;
 					}
 				}
 
-				// sensivity
-				for (iBand = 0; iBand < m->m_nBands; iBand++)
+				// integrate FFT results into log-scale frequency bands
+				if (m->m_bndType == Measure::BNDTYPE_FFT || m->m_bndType == Measure::BNDTYPE_ALL)
 				{
-					m->m_bandTmpOut[iBand] = max(0, m->m_sensitivity * log10(CLAMP01(m->m_bandTmpOut[iBand])) + 1.0);
-				}
+					memset(m->m_bandTmpOut, 0, m->m_nBands * sizeof(float));
+					int iBin = (int)((m->m_freqMin / df) - 0.5);
+					int iBand = 0;
+					float f0 = m->m_freqMin;
 
-				// smoothing
-				for (iBand = 0; iBand < m->m_nBands; iBand++) 
-				{
-					float x = 0;
-					for (int s = -m->m_smoothing; s <= m->m_smoothing; s++)
+					while (iBin <= (m->m_fftBufferSize * 0.5) && iBand < m->m_nBands)
 					{
-						x += m->m_bandTmpOut[(iBand + s <= 0) || (iBand + s >= m->m_nBands) ? iBand : iBand + s];
+						const float fLin1 = ((float)iBin + 0.5f) * df;
+						const float fLog1 = m->m_bandFreq[iBand];
+						float& y = m->m_bandTmpOut[iBand];
+
+						if (fLin1 <= fLog1)
+						{
+							y += (fLin1 - f0) * m->m_fftOut[iBin] * bandScalar;
+							f0 = fLin1;
+							iBin += 1;
+						}
+						else
+						{
+							y += (fLog1 - f0) * m->m_fftOut[iBin] * bandScalar;
+							f0 = fLog1;
+							iBand += 1;
+						}
 					}
-					m->m_bandOut[iBand] = x * smoothingScalar;
+
+					// sensivity
+					for (iBand = 0; iBand < m->m_nBands; iBand++)
+					{
+						m->m_bandTmpOut[iBand] = max(0, m->m_sensitivity * log10(CLAMP01(m->m_bandTmpOut[iBand])) + 1.0);
+					}
+
+					// smoothing
+					for (iBand = 0; iBand < m->m_nBands; iBand++)
+					{
+						float x = 0;
+						for (int s = -m->m_smoothing; s <= m->m_smoothing; s++)
+						{
+							x += m->m_bandTmpOut[(iBand + s <= 0) || (iBand + s >= m->m_nBands) ? iBand : iBand + s];
+						}
+						m->m_bandOut[iBand] = x * smoothingScalar;
+					}
 				}
 			}
 		}
@@ -858,6 +952,12 @@ PLUGIN_EXPORT double Update(void* data)
 		if (parent->m_clCapture && parent->m_nBands && m->m_bandIdx < parent->m_nBands)
 		{
 			return parent->m_bandFreq[m->m_bandIdx];
+		}
+		break;
+	case Measure::TYPE_WAVE:
+		if (parent->m_clCapture && parent->m_nBands)
+		{
+			return parent->m_waveOut[m->m_bandIdx];
 		}
 		break;
 	case Measure::TYPE_RMS:
@@ -1141,7 +1241,7 @@ HRESULT	Measure::DeviceInit()
 		m_fftKWdw[0] = 0.0;
 	}
 
-	// calculate band frequencies and allocate band output buffers
+	// calculate band frequencies and allocate band and wave output buffers
 	if (m_nBands)
 	{
 		m_bandFreq = (float*)malloc(m_nBands * sizeof(float));
@@ -1149,16 +1249,21 @@ HRESULT	Measure::DeviceInit()
 		m_bandFreq[0] = (float)(m_freqMin * pow(2.0, step));
 
 		df = (float)m_wfx->nSamplesPerSec / m_fftBufferSize;
+		dw = (float)m_fftSize / m_nBands;
 		bandScalar = 2.0f / (float)m_wfx->nSamplesPerSec;
 		smoothingScalar = (float)(1.0 / ((m_smoothing * 2) + 1));
+		waveScalar = (float)(1.0 / dw);
 
 		for (int iBand = 1; iBand < m_nBands; ++iBand)
 		{
 			m_bandFreq[iBand] = (float)(m_bandFreq[iBand - 1] * pow(2.0, step));
 		}
 
+		m_waveTmpOut2 = (float*)calloc(m_nBands * sizeof(float), 1);
+		m_waveTmpOut = (float*)calloc(m_fftSize * sizeof(float), 1);
 		m_bandTmpOut = (float*)calloc(m_nBands * sizeof(float), 1);
 		m_bandOut = (float*)calloc(m_nBands * sizeof(float), 1);
+		m_waveOut = (float*)calloc(m_nBands * sizeof(float), 1);
 	}
 
 	hr = m_clBugAudio->Initialize(
@@ -1343,6 +1448,15 @@ void Measure::DeviceRelease()
 
 	if (m_bandTmpOut) free(m_bandTmpOut);
 	m_bandTmpOut = NULL;
+
+	if (m_waveOut) free(m_waveOut);
+	m_waveOut = NULL;
+
+	if (m_waveTmpOut) free(m_waveTmpOut);
+	m_waveTmpOut = NULL;
+
+	if (m_waveTmpOut2) free(m_waveTmpOut2);
+	m_waveTmpOut2 = NULL;
 
 	for (int iChan = 0; iChan < Measure::MAX_CHANNELS; ++iChan)
 	{
