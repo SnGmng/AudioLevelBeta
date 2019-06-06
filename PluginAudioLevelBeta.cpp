@@ -162,7 +162,7 @@ struct Measure
 	float					m_kRMS[2];					// RMS attack/decay filter constants
 	float					m_kPeak[2];					// peak attack/decay filter constants
 	float					m_kFFT[2];					// FFT attack/decay filter constants
-	BYTE*					m_bufChunk;					// buffer for latest data chunk copy
+	float*					m_bufChunk;					// buffer for latest data chunk copy
 	double					m_rms[MAX_CHANNELS];		// current RMS levels
 	double					m_peak[MAX_CHANNELS];		// current peak levels
 	kiss_fftr_cfg			m_fftCfg;					// FFT states for each channel
@@ -276,7 +276,7 @@ struct Measure
 	};
 };
 
-float df, dw, fftScalar, bandScalar, smoothingScalar, waveScalar;
+float df, dw, fftScalar, bandScalar, smoothingScalar, waveScalar, pcmScalar;
 
 const CLSID CLSID_MMDeviceEnumerator = __uuidof(MMDeviceEnumerator);
 const IID IID_IMMDeviceEnumerator = __uuidof(IMMDeviceEnumerator);
@@ -617,7 +617,18 @@ PLUGIN_EXPORT double Update(void* data)
 		{
 			while (m->m_clCapture->GetBuffer(&buffer, &nFrames, &flags, NULL, NULL) == S_OK)
 			{
-				memcpy(&m->m_bufChunk[0], &buffer[0], nFrames * m->m_wfx->nBlockAlign);
+				if (m->m_format == Measure::FMT_PCM_F32)
+				{
+					memcpy(&m->m_bufChunk[0], &buffer[0], nFrames * m->m_wfx->nBlockAlign);
+				}
+				else if (m->m_format == Measure::FMT_PCM_S16)
+				{
+					INT16* buf = (INT16*)buffer;
+					for (int iPcm = 0; iPcm < nFrames * m->m_wfx->nChannels; ++iPcm)
+					{
+						m->m_bufChunk[iPcm] = (float)buf[iPcm] * pcmScalar;
+					}
+				}
 
 				// release buffer immediately to resume capture
 				m->m_clCapture->ReleaseBuffer(nFrames);
@@ -637,97 +648,46 @@ PLUGIN_EXPORT double Update(void* data)
 						}
 
 						// loops unrolled for float, 16b and mono, stereo
-						if (m->m_format == Measure::FMT_PCM_F32)
+						if (m->m_wfx->nChannels == 1)
 						{
-							float* s = (float*)buffer;
-							if (m->m_wfx->nChannels == 1)
+							for (int iFrame = 0; iFrame < nFrames;)
 							{
-								for (int iFrame = 0; iFrame < nFrames; ++iFrame)
-								{
-									float xL = (float)*s++;
-									float sqrL = xL * xL;
-									float absL = abs(xL);
-									rms[0] = sqrL + m->m_kRMS[(sqrL < rms[0])] * (rms[0] - sqrL);
-									peak[0] = absL + m->m_kPeak[(absL < peak[0])] * (peak[0] - absL);
-									rms[1] = rms[0];
-									peak[1] = peak[0];
-								}
-							}
-							else if (m->m_wfx->nChannels == 2)
-							{
-								for (int iFrame = 0; iFrame < nFrames; ++iFrame)
-								{
-									float xL = (float)*s++;
-									float xR = (float)*s++;
-									float sqrL = xL * xL;
-									float sqrR = xR * xR;
-									float absL = abs(xL);
-									float absR = abs(xR);
-									rms[0] = sqrL + m->m_kRMS[(sqrL < rms[0])] * (rms[0] - sqrL);
-									rms[1] = sqrR + m->m_kRMS[(sqrR < rms[1])] * (rms[1] - sqrR);
-									peak[0] = absL + m->m_kPeak[(absL < peak[0])] * (peak[0] - absL);
-									peak[1] = absR + m->m_kPeak[(absR < peak[1])] * (peak[1] - absR);
-								}
-							}
-							else
-							{
-								for (int iFrame = 0; iFrame < nFrames; ++iFrame)
-								{
-									for (int iChan = 0; iChan < m->m_wfx->nChannels; ++iChan)
-									{
-										float x = (float)*s++;
-										float sqrX = x * x;
-										float absX = abs(x);
-										rms[iChan] = sqrX + m->m_kRMS[(sqrX < rms[iChan])] * (rms[iChan] - sqrX);
-										peak[iChan] = absX + m->m_kPeak[(absX < peak[iChan])] * (peak[iChan] - absX);
-									}
-								}
+								float xL = (float)m->m_bufChunk[iFrame++];
+								float sqrL = xL * xL;
+								float absL = abs(xL);
+								rms[0] = sqrL + m->m_kRMS[(sqrL < rms[0])] * (rms[0] - sqrL);
+								peak[0] = absL + m->m_kPeak[(absL < peak[0])] * (peak[0] - absL);
+								rms[1] = rms[0];
+								peak[1] = peak[0];
 							}
 						}
-						else if (m->m_format == Measure::FMT_PCM_S16)
+						else if (m->m_wfx->nChannels == 2)
 						{
-							INT16* s = (INT16*)buffer;
-							if (m->m_wfx->nChannels == 1)
+							for (int iFrame = 0; iFrame < nFrames * 2;)
 							{
-								for (int iFrame = 0; iFrame < nFrames; ++iFrame)
-								{
-									float xL = (float)*s++ * 1.0f / 0x7fff;
-									float sqrL = xL * xL;
-									float absL = abs(xL);
-									rms[0] = sqrL + m->m_kRMS[(sqrL < rms[0])] * (rms[0] - sqrL);
-									peak[0] = absL + m->m_kPeak[(absL < peak[0])] * (peak[0] - absL);
-									rms[1] = rms[0];
-									peak[1] = peak[0];
-								}
+								float xL = (float)m->m_bufChunk[iFrame++];
+								float xR = (float)m->m_bufChunk[iFrame++];
+								float sqrL = xL * xL;
+								float sqrR = xR * xR;
+								float absL = abs(xL);
+								float absR = abs(xR);
+								rms[0] = sqrL + m->m_kRMS[(sqrL < rms[0])] * (rms[0] - sqrL);
+								rms[1] = sqrR + m->m_kRMS[(sqrR < rms[1])] * (rms[1] - sqrR);
+								peak[0] = absL + m->m_kPeak[(absL < peak[0])] * (peak[0] - absL);
+								peak[1] = absR + m->m_kPeak[(absR < peak[1])] * (peak[1] - absR);
 							}
-							else if (m->m_wfx->nChannels == 2)
+						}
+						else
+						{
+							for (int iFrame = 0; iFrame < nFrames * m->m_wfx->nChannels;)
 							{
-								for (int iFrame = 0; iFrame < nFrames; ++iFrame)
+								for (int iChan = 0; iChan < m->m_wfx->nChannels; ++iChan)
 								{
-									float xL = (float)*s++ * 1.0f / 0x7fff;
-									float xR = (float)*s++ * 1.0f / 0x7fff;
-									float sqrL = xL * xL;
-									float sqrR = xR * xR;
-									float absL = abs(xL);
-									float absR = abs(xR);
-									rms[0] = sqrL + m->m_kRMS[(sqrL < rms[0])] * (rms[0] - sqrL);
-									rms[1] = sqrR + m->m_kRMS[(sqrR < rms[1])] * (rms[1] - sqrR);
-									peak[0] = absL + m->m_kPeak[(absL < peak[0])] * (peak[0] - absL);
-									peak[1] = absR + m->m_kPeak[(absR < peak[1])] * (peak[1] - absR);
-								}
-							}
-							else
-							{
-								for (int iFrame = 0; iFrame < nFrames; ++iFrame)
-								{
-									for (int iChan = 0; iChan < m->m_wfx->nChannels; ++iChan)
-									{
-										float x = (float)*s++ * 1.0f / 0x7fff;
-										float sqrX = x * x;
-										float absX = abs(x);
-										rms[iChan] = sqrX + m->m_kRMS[(sqrX < rms[iChan])] * (rms[iChan] - sqrX);
-										peak[iChan] = absX + m->m_kPeak[(absX < peak[iChan])] * (peak[iChan] - absX);
-									}
+									float x = (float)m->m_bufChunk[iFrame++];
+									float sqrX = x * x;
+									float absX = abs(x);
+									rms[iChan] = sqrX + m->m_kRMS[(sqrX < rms[iChan])] * (rms[iChan] - sqrX);
+									peak[iChan] = absX + m->m_kPeak[(absX < peak[iChan])] * (peak[iChan] - absX);
 								}
 							}
 						}
@@ -742,10 +702,7 @@ PLUGIN_EXPORT double Update(void* data)
 					// store data in ring buffers, and demux streams for FFT
 					if (m->m_fftSize)
 					{
-						float* sF32 = (float*)m->m_bufChunk;
-						INT16* sI16 = (INT16*)m->m_bufChunk;
-
-						for (int iFrame = 0; iFrame < nFrames; ++iFrame)
+						for (int iFrame = 0; iFrame < nFrames * m->m_wfx->nChannels;)
 						{
 							for (int iChan = 0; iChan < m->m_wfx->nChannels; ++iChan)
 							{
@@ -754,19 +711,17 @@ PLUGIN_EXPORT double Update(void* data)
 									if (iChan == Measure::CHANNEL_FL)
 									{
 										// cannot increment before evaluation
-										const float L = m->m_format == Measure::FMT_PCM_F32 ? *sF32++ : (float)*sI16++ * 1.0f / 0x7fff;
+										const float L = m->m_bufChunk[iFrame++];
 
-										m->m_fftIn[m->m_fftBufW] = m->m_format == Measure::FMT_PCM_F32 ?
-
-											// stereo to mono: (L + R) / 2
-											0.5 * (L + *sF32++) : 0.5 * (((float)L * 1.0f / 0x7fff) + ((float)*sI16++ * 1.0f / 0x7fff));
+										// stereo to mono: (L + R) / 2
+										m->m_fftIn[m->m_fftBufW] = 0.5 * (L + m->m_bufChunk[iFrame++]);
 									}
 								}
 								else if (iChan == m->m_channel)
 								{
-									m->m_fftIn[m->m_fftBufW] = m->m_format == Measure::FMT_PCM_F32 ? *sF32++ : (float)*sI16++ * 1.0f / 0x7fff;
+									m->m_fftIn[m->m_fftBufW] = m->m_bufChunk[iFrame++];
 								}
-								else { ++sF32; ++sI16; }	// move along the raw data buffer
+								else { ++iFrame; }	// move along the raw data buffer
 							}
 							m->m_fftBufW = (m->m_fftBufW + 1) % m->m_fftSize;	// move along the data-to-process buffer
 						}
@@ -1218,6 +1173,8 @@ HRESULT	Measure::DeviceInit()
 	}
 	if (!m_wfx) { m_wfx = &m_wfxR; }
 
+	pcmScalar = 1.0f / 0x7fff;
+
 	// setup FFT buffers
 	if (m_fftSize)
 	{
@@ -1390,7 +1347,7 @@ HRESULT	Measure::DeviceInit()
 	}
 	EXIT_ON_ERROR(hr);
 
-	m_bufChunk = (BYTE*)calloc(nMaxFrames * m_wfx->nBlockAlign * sizeof(BYTE), 1);
+	m_bufChunk = (float*)calloc(nMaxFrames * m_wfx->nBlockAlign * sizeof(float), 1);
 
 	return S_OK;
 
