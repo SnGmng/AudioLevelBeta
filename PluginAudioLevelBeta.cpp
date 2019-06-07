@@ -483,6 +483,7 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 		L"Band",							// TYPE_BAND
 		L"FFTFreq",							// TYPE_FFTFREQ
 		L"BandFreq",						// TYPE_BANDFREQ
+		L"Wave",							// TYPE_WAVE
 		L"Format",							// TYPE_FORMAT
 		L"DeviceStatus",					// TYPE_DEV_STATUS
 		L"DeviceName",						// TYPE_DEV_NAME
