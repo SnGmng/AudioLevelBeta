@@ -75,8 +75,8 @@ struct Measure
 		CHANNEL_BR,
 		CHANNEL_SL,
 		CHANNEL_SR,
-		MAX_CHANNELS,
-		CHANNEL_SUM = MAX_CHANNELS
+		CHANNEL_SUM,
+		MAX_CHANNELS
 	};
 
 	enum Type
@@ -143,6 +143,7 @@ struct Measure
 	double					m_sensitivity;				// dB range for FFT/Band return values (parsed from options)
 	Measure*				m_parent;					// parent measure, if any
 	void*					m_skin;						// skin pointer
+	void*					m_rm;						// rainmeter pointer
 	LPCWSTR					m_rmName;					// measure name
 	IMMDeviceEnumerator*	m_enum;						// audio endpoint enumerator
 	IMMDevice*				m_dev;						// audio endpoint device
@@ -163,8 +164,8 @@ struct Measure
 	float					m_kPeak[2];					// peak attack/decay filter constants
 	float					m_kFFT[2];					// FFT attack/decay filter constants
 	float*					m_bufChunk;					// buffer for latest data chunk copy
-	double					m_rms[MAX_CHANNELS];		// current RMS levels
-	double					m_peak[MAX_CHANNELS];		// current peak levels
+	float					m_rms[MAX_CHANNELS];		// current RMS levels
+	float					m_peak[MAX_CHANNELS];		// current peak levels
 	kiss_fftr_cfg			m_fftCfg;					// FFT states for each channel
 	float*					m_fftIn;					// buffer for FFT input
 	float*					m_fftOut;					// buffer for FFT output
@@ -198,6 +199,7 @@ struct Measure
 		m_sensitivity(0.0),
 		m_parent(NULL),
 		m_skin(NULL),
+		m_rm(NULL),
 		m_rmName(NULL),
 		m_enum(NULL),
 		m_dev(NULL),
@@ -399,28 +401,6 @@ PLUGIN_EXPORT void Initialize(void** data, void* rm)
 		}
 	}
 
-	// parse band type specifier
-	LPCWSTR bndType = RmReadString(rm, L"BandType", L"");
-	if (bndType && *bndType)
-	{
-		if (_wcsicmp(bndType, L"FFT") == 0)
-		{
-			m->m_bndType = Measure::BNDTYPE_FFT;
-		}
-		else if (_wcsicmp(bndType, L"Wave") == 0)
-		{
-			m->m_bndType = Measure::BNDTYPE_WAVE;
-		}
-		else if (_wcsicmp(bndType, L"All") == 0)
-		{
-			m->m_bndType = Measure::BNDTYPE_ALL;
-		}
-		else
-		{
-			RmLogF(rm, LOG_ERROR, L"Invalid Band Type '%s', must be one of: FFT or Wave or All.", bndType);
-		}
-	}
-
 	// initialize FFT data
 	m->m_fftSize = RmReadInt(rm, L"FFTSize", m->m_fftSize);
 	if (m->m_fftSize < 0 || m->m_fftSize & 1)
@@ -503,13 +483,25 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 		L"Band",							// TYPE_BAND
 		L"FFTFreq",							// TYPE_FFTFREQ
 		L"BandFreq",						// TYPE_BANDFREQ
-		L"Wave",							// TYPE_WAVE
 		L"Format",							// TYPE_FORMAT
 		L"DeviceStatus",					// TYPE_DEV_STATUS
 		L"DeviceName",						// TYPE_DEV_NAME
 		L"DeviceID",						// TYPE_DEV_ID
 		L"DeviceList",						// TYPE_DEV_LIST
 		L"BufferStatus"						// TYPE_BUFFERSTATUS
+	};
+
+	static const LPCWSTR s_chanName[Measure::MAX_CHANNELS][3] =
+	{
+		{ L"L",		L"FL",		L"0", },	// CHANNEL_FL
+		{ L"R",		L"FR",		L"1", },	// CHANNEL_FR
+		{ L"C",		L"",		L"2", },	// CHANNEL_C
+		{ L"LFE",	L"Sub",		L"3", },	// CHANNEL_LFE
+		{ L"BL",	L"",		L"4", },	// CHANNEL_BL
+		{ L"BR",	L"",		L"5", },	// CHANNEL_BR
+		{ L"SL",	L"",		L"6", },	// CHANNEL_SL
+		{ L"SR",	L"",		L"7", },	// CHANNEL_SR
+		{ L"Sum",	L"Avg",		L"", },		// CHANNEL_SUM
 	};
 
 	Measure* m = (Measure*)data;
@@ -539,6 +531,42 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 			{
 				d += _snwprintf_s(d, (sizeof(msg) + (UINT32)msg - (UINT32)d) / sizeof(WCHAR), _TRUNCATE,
 					L"%s%s%s", i ? L", " : L" ", i == (Measure::NUM_TYPES - 1) ? L"or " : L"", s_typeName[i]);
+			}
+
+			d += _snwprintf_s(d, (sizeof(msg) + (UINT32)msg - (UINT32)d) / sizeof(WCHAR), _TRUNCATE, L".");
+			RmLogF(rm, LOG_ERROR, msg);
+		}
+	}
+
+	// parse channel specifier
+	LPCWSTR channel = RmReadString(rm, L"Channel", L"");
+	if (*channel)
+	{
+		bool found = false;
+		for (int iChan = 0; iChan <= Measure::CHANNEL_SUM && !found; ++iChan)
+		{
+			for (int j = 0; j < 3; ++j)
+			{
+				if (_wcsicmp(channel, s_chanName[iChan][j]) == 0)
+				{
+					m->m_channel = (Measure::Channel)iChan;
+					found = true;
+					break;
+				}
+			}
+		}
+
+		if (!found)
+		{
+			WCHAR msg[512];
+			WCHAR* d = msg;
+			d += _snwprintf_s(d, (sizeof(msg) + (UINT32)msg - (UINT32)d) / sizeof(WCHAR), _TRUNCATE,
+				L"Invalid Channel '%s', must be an integer between 0 and %d, or one of:", channel, Measure::MAX_CHANNELS - 2);
+
+			for (int i = 0; i <= Measure::CHANNEL_SUM; ++i)
+			{
+				d += _snwprintf_s(d, (sizeof(msg) + (UINT32)msg - (UINT32)d) / sizeof(WCHAR), _TRUNCATE,
+					L"%s%s%s", i ? L", " : L" ", i == Measure::CHANNEL_SUM ? L"or " : L"", s_chanName[i][0]);
 			}
 
 			d += _snwprintf_s(d, (sizeof(msg) + (UINT32)msg - (UINT32)d) / sizeof(WCHAR), _TRUNCATE, L".");
@@ -639,64 +667,25 @@ PLUGIN_EXPORT double Update(void* data)
 					if (m->m_type == Measure::TYPE_RMS || m->m_type == Measure::TYPE_PEAK)
 					{
 						// measure RMS and peak levels
-						float rms[Measure::MAX_CHANNELS];
-						float peak[Measure::MAX_CHANNELS];
-						for (int iChan = 0; iChan < Measure::MAX_CHANNELS; ++iChan)
-						{
-							rms[iChan] = (float)m->m_rms[iChan];
-							peak[iChan] = (float)m->m_peak[iChan];
-						}
-
 						// loops unrolled for float, 16b and mono, stereo
-						if (m->m_wfx->nChannels == 1)
+						for (int iFrame = 0; iFrame < nFrames * m->m_wfx->nChannels;)
 						{
-							for (int iFrame = 0; iFrame < nFrames;)
+							for (int iChan = 0; iChan < m->m_wfx->nChannels; ++iChan)
 							{
-								float xL = (float)m->m_bufChunk[iFrame++];
-								float sqrL = xL * xL;
-								float absL = abs(xL);
-								rms[0] = sqrL + m->m_kRMS[(sqrL < rms[0])] * (rms[0] - sqrL);
-								peak[0] = absL + m->m_kPeak[(absL < peak[0])] * (peak[0] - absL);
-								rms[1] = rms[0];
-								peak[1] = peak[0];
-							}
-						}
-						else if (m->m_wfx->nChannels == 2)
-						{
-							for (int iFrame = 0; iFrame < nFrames * 2;)
-							{
-								float xL = (float)m->m_bufChunk[iFrame++];
-								float xR = (float)m->m_bufChunk[iFrame++];
-								float sqrL = xL * xL;
-								float sqrR = xR * xR;
-								float absL = abs(xL);
-								float absR = abs(xR);
-								rms[0] = sqrL + m->m_kRMS[(sqrL < rms[0])] * (rms[0] - sqrL);
-								rms[1] = sqrR + m->m_kRMS[(sqrR < rms[1])] * (rms[1] - sqrR);
-								peak[0] = absL + m->m_kPeak[(absL < peak[0])] * (peak[0] - absL);
-								peak[1] = absR + m->m_kPeak[(absR < peak[1])] * (peak[1] - absR);
-							}
-						}
-						else
-						{
-							for (int iFrame = 0; iFrame < nFrames * m->m_wfx->nChannels;)
-							{
-								for (int iChan = 0; iChan < m->m_wfx->nChannels; ++iChan)
-								{
-									float x = (float)m->m_bufChunk[iFrame++];
-									float sqrX = x * x;
-									float absX = abs(x);
-									rms[iChan] = sqrX + m->m_kRMS[(sqrX < rms[iChan])] * (rms[iChan] - sqrX);
-									peak[iChan] = absX + m->m_kPeak[(absX < peak[iChan])] * (peak[iChan] - absX);
-								}
+								float x = (float)m->m_bufChunk[iFrame++];
+								float sqrX = x * x;
+								float absX = abs(x);
+								m->m_rms[iChan] = sqrX + m->m_kRMS[(sqrX < m->m_rms[iChan])] * (m->m_rms[iChan] - sqrX);
+								m->m_peak[iChan] = absX + m->m_kPeak[(absX < m->m_peak[iChan])] * (m->m_peak[iChan] - absX);
 							}
 						}
 
-						for (int iChan = 0; iChan < Measure::MAX_CHANNELS; ++iChan)
-						{
-							m->m_rms[iChan] = rms[iChan];
-							m->m_peak[iChan] = peak[iChan];
-						}
+						// rms and peak values for sum channel
+						m->m_rms[Measure::CHANNEL_SUM] = m->m_wfx->nChannels >= 2
+							? (m->m_rms[Measure::CHANNEL_FL] + m->m_rms[Measure::CHANNEL_FR]) * 0.5
+							: m->m_rms[Measure::CHANNEL_FL];
+
+						//RmLogF(m->m_rm, LOG_NOTICE, L"RMS CALCULATED, Channel %d: %f", 0, m->m_rms[0]);
 					}
 
 					// store data in ring buffers, and demux streams for FFT
@@ -916,22 +905,14 @@ PLUGIN_EXPORT double Update(void* data)
 		}
 		break;
 	case Measure::TYPE_RMS:
-		if (m->m_channel == Measure::CHANNEL_SUM)
+		if (parent->m_clCapture && parent->m_rms) 
 		{
-			return CLAMP01((sqrt(parent->m_rms[0]) + sqrt(parent->m_rms[1])) * 0.5 * parent->m_gainRMS);
-		}
-		else
-		{
+			//RmLogF(m->m_rm, LOG_NOTICE, L"RMS CALCULATED, Channel %d: %f", m->m_channel, m->m_rms[m->m_channel]);
 			return CLAMP01(sqrt(parent->m_rms[m->m_channel]) * parent->m_gainRMS);
 		}
 		break;
-
 	case Measure::TYPE_PEAK:
-		if (m->m_channel == Measure::CHANNEL_SUM)
-		{
-			return CLAMP01((parent->m_peak[0] + parent->m_peak[1]) * 0.5 * parent->m_gainPeak);
-		}
-		else
+		if (parent->m_clCapture && parent->m_peak)
 		{
 			return CLAMP01(parent->m_peak[m->m_channel] * parent->m_gainPeak);
 		}
