@@ -253,6 +253,7 @@ struct Measure
 
 	HRESULT DeviceInit();
 	void DeviceRelease();
+	void VariablesInit();
 
 	void DoCaptureLoop()
 	{
@@ -352,78 +353,6 @@ PLUGIN_EXPORT void Initialize(void** data, void* rm)
 		_snwprintf_s(m->m_reqID, _TRUNCATE, L"%s", reqID);
 	}
 
-	static const LPCWSTR s_chanName[Measure::CHANNEL_SUM + 1][3] =
-	{
-		{ L"L",		L"FL",		L"0", },	// CHANNEL_FL
-		{ L"R",		L"FR",		L"1", },	// CHANNEL_FR
-		{ L"C",		L"",		L"2", },	// CHANNEL_C
-		{ L"LFE",	L"Sub",		L"3", },	// CHANNEL_LFE
-		{ L"BL",	L"",		L"4", },	// CHANNEL_BL
-		{ L"BR",	L"",		L"5", },	// CHANNEL_BR
-		{ L"SL",	L"",		L"6", },	// CHANNEL_SL
-		{ L"SR",	L"",		L"7", },	// CHANNEL_SR
-		{ L"Sum",	L"Avg",		L"", },		// CHANNEL_SUM
-	};
-
-	// parse channel specifier
-	LPCWSTR channel = RmReadString(rm, L"Channel", L"");
-	if (*channel)
-	{
-		bool found = false;
-		for (int iChan = 0; iChan <= Measure::CHANNEL_SUM && !found; ++iChan)
-		{
-			for (int j = 0; j < 3; ++j)
-			{
-				if (_wcsicmp(channel, s_chanName[iChan][j]) == 0)
-				{
-					m->m_channel = (Measure::Channel)iChan;
-					found = true;
-					break;
-				}
-			}
-		}
-
-		if (!found)
-		{
-			WCHAR msg[512];
-			WCHAR* d = msg;
-			d += _snwprintf_s(d, (sizeof(msg) + (UINT32)msg - (UINT32)d) / sizeof(WCHAR), _TRUNCATE,
-				L"Invalid Channel '%s', must be an integer between 0 and %d, or one of:", channel, Measure::MAX_CHANNELS - 1);
-
-			for (int i = 0; i <= Measure::CHANNEL_SUM; ++i)
-			{
-				d += _snwprintf_s(d, (sizeof(msg) + (UINT32)msg - (UINT32)d) / sizeof(WCHAR), _TRUNCATE,
-					L"%s%s%s", i ? L", " : L" ", i == Measure::CHANNEL_SUM ? L"or " : L"", s_chanName[i][0]);
-			}
-
-			d += _snwprintf_s(d, (sizeof(msg) + (UINT32)msg - (UINT32)d) / sizeof(WCHAR), _TRUNCATE, L".");
-			RmLogF(rm, LOG_ERROR, msg);
-		}
-	}
-
-	// initialize FFT data
-	m->m_fftSize = RmReadInt(rm, L"FFTSize", m->m_fftSize);
-	if (m->m_fftSize < 0 || m->m_fftSize & 1)
-	{
-		RmLogF(rm, LOG_ERROR, L"Invalid FFTSize %ld: must be an even integer >= 0. (powers of 2 work best)", m->m_fftSize);
-		m->m_fftSize = 0;
-	}
-
-	m->m_fftBufferSize = max(m->m_fftSize, RmReadInt(rm, L"FFTBufferSize", m->m_fftBufferSize));
-
-	// initialize frequency bands
-	m->m_nBands = RmReadInt(rm, L"Bands", m->m_nBands);
-	if (m->m_nBands < 0)
-	{
-		RmLogF(rm, LOG_ERROR, L"Invalid Bands %ld: must be an integer >= 0.", m->m_nBands);
-		m->m_nBands = 0;
-	}
-
-	// initialize smoothing
-	m->m_smoothing = max(0, RmReadInt(rm, L"Smoothing", m->m_smoothing));
-
-	m->m_freqMin = max(0.0, RmReadDouble(rm, L"FreqMin", m->m_freqMin));
-	m->m_freqMax = max(0.0, RmReadDouble(rm, L"FreqMax", m->m_freqMax));
 	// create the enumerator
 	if (CoCreateInstance(CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, IID_IMMDeviceEnumerator, (void**)&m->m_enum) == S_OK)
 	{
@@ -575,21 +504,96 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 		}
 	}
 
-	// parse FFT index request
-	m->m_fftIdx = max(0, RmReadInt(rm, L"FFTIdx", m->m_fftIdx));
-	m->m_fftIdx = m->m_parent ?
-		min(m->m_parent->m_fftBufferSize / 2, m->m_fftIdx) :
-		min(m->m_fftBufferSize / 2, m->m_fftIdx);
-
-	// parse band index request
-	m->m_bandIdx = max(0, RmReadInt(rm, L"BandIdx", m->m_bandIdx));
-	m->m_bandIdx = m->m_parent ?
-		min(m->m_parent->m_nBands, m->m_bandIdx) :
-		min(m->m_nBands, m->m_bandIdx);
-
-	// parse envelope values on parents only
+	// parse envelope, fft and band values on parents only
 	if (!m->m_parent)
 	{
+		int fftSize = RmReadInt(rm, L"FFTSize", m->m_fftSize);
+		int fftBufferSize = max(m->m_fftSize, RmReadInt(rm, L"FFTBufferSize", m->m_fftBufferSize));
+		int nBands = RmReadInt(rm, L"Bands", m->m_nBands);
+		int smoothing = max(0, RmReadInt(rm, L"Smoothing", m->m_smoothing));
+		int freqMin = max(0.0, RmReadDouble(rm, L"FreqMin", m->m_freqMin));
+		int freqMax = max(0.0, RmReadDouble(rm, L"FreqMax", m->m_freqMax));
+
+		// if one of these values changed, reinitialize
+		if (m->m_fftSize		!= fftSize ||
+			m->m_fftBufferSize	!= fftBufferSize ||
+			m->m_freqMin		!= freqMin ||
+			m->m_freqMax		!= freqMax ||
+			m->m_nBands			!= nBands ||
+			m->m_smoothing		!= smoothing)
+		{
+			// initialize FFT data
+			if (m->m_fftSize < 0 || m->m_fftSize & 1)
+			{
+				RmLogF(rm, LOG_ERROR, L"Invalid FFTSize %ld: must be an even integer >= 0. (powers of 2 work best)", fftSize);
+				fftSize = 0;
+			}
+			m->m_fftSize = fftSize;
+			m->m_fftBufferSize = fftBufferSize;
+
+			// initialize frequency bands
+			if (nBands < 0)
+			{
+				RmLogF(rm, LOG_ERROR, L"Invalid Bands %ld: must be an integer >= 0.", nBands);
+				nBands = 0;
+			}
+			m->m_nBands = nBands;
+
+			// initialize smoothing
+			m->m_smoothing = smoothing;
+
+			m->m_freqMin = freqMin;
+			m->m_freqMax = freqMax;
+
+			// setup FFT buffers
+			if (m->m_fftSize)
+			{
+				m->m_fftIn = (float*)calloc(m->m_fftSize * sizeof(float), 1);
+				m->m_fftKWdw = (float*)calloc(m->m_fftSize * sizeof(float), 1);
+				m->m_fftTmpIn = (float*)calloc(m->m_fftBufferSize * sizeof(float), 1);
+
+				m->m_fftCfg = kiss_fftr_alloc(m->m_fftBufferSize, 0, NULL, NULL);
+				m->m_fftTmpOut = (kiss_fft_cpx*)calloc(m->m_fftBufferSize * sizeof(kiss_fft_cpx), 1);
+
+				m->m_fftOut = (float*)calloc(m->m_fftBufferSize * sizeof(float), 1);
+
+				fftScalar = (float)(1.0 / sqrt(m->m_fftSize));
+
+				// zero-padding - https://jackschaedler.github.io/circles-sines-signals/zeropadding.html
+				for (int iBin = 0; iBin < m->m_fftBufferSize; ++iBin) m->m_fftTmpIn[iBin] = 0.0;
+
+				// calculate window function coefficients (http://en.wikipedia.org/wiki/Window_function#Hann_.28Hanning.29_window)
+				for (unsigned int iBin = 1; iBin < m->m_fftSize; ++iBin)
+					m->m_fftKWdw[iBin] = (float)(0.5 * (1.0 - cos(TWOPI * iBin / (m->m_fftSize + 1))));		// periodic version for FFT/spectral analysis
+				m->m_fftKWdw[0] = 0.0;
+			}
+
+			// calculate band frequencies and allocate band and wave output buffers
+			if (m->m_nBands)
+			{
+				m->m_bandFreq = (float*)malloc(m->m_nBands * sizeof(float));
+				const double step = (log(m->m_freqMax / m->m_freqMin) / m->m_nBands) / log(2.0);
+				m->m_bandFreq[0] = (float)(m->m_freqMin * pow(2.0, step));
+
+				df = (float)m->m_wfx->nSamplesPerSec / m->m_fftBufferSize;
+				dw = (float)m->m_fftSize / m->m_nBands;
+				bandScalar = 2.0f / (float)m->m_wfx->nSamplesPerSec;
+				smoothingScalar = (float)(1.0 / ((m->m_smoothing * 2) + 1));
+				waveScalar = (float)(1.0 / dw);
+
+				for (int iBand = 1; iBand < m->m_nBands; ++iBand)
+				{
+					m->m_bandFreq[iBand] = (float)(m->m_bandFreq[iBand - 1] * pow(2.0, step));
+				}
+
+				m->m_waveTmpOut2 = (float*)calloc(m->m_nBands * sizeof(float), 1);
+				m->m_waveTmpOut = (float*)calloc(m->m_fftSize * sizeof(float), 1);
+				m->m_bandTmpOut = (float*)calloc(m->m_nBands * sizeof(float), 1);
+				m->m_bandOut = (float*)calloc(m->m_nBands * sizeof(float), 1);
+				m->m_waveOut = (float*)calloc(m->m_nBands * sizeof(float), 1);
+			}
+		}
+
 		// (re)parse envelope values
 		m->m_envRMS[0] = max(0, RmReadInt(rm, L"RMSAttack", m->m_envRMS[0]));
 		m->m_envRMS[1] = max(0, RmReadInt(rm, L"RMSDecay", m->m_envRMS[1]));
@@ -621,6 +625,18 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 			}
 		}
 	}
+
+	// parse FFT index request
+	m->m_fftIdx = max(0, RmReadInt(rm, L"FFTIdx", m->m_fftIdx));
+	m->m_fftIdx = m->m_parent ?
+		min(m->m_parent->m_fftBufferSize / 2, m->m_fftIdx) :
+		min(m->m_fftBufferSize / 2, m->m_fftIdx);
+
+	// parse band index request
+	m->m_bandIdx = max(0, RmReadInt(rm, L"BandIdx", m->m_bandIdx));
+	m->m_bandIdx = m->m_parent ?
+		min(m->m_parent->m_nBands, m->m_bandIdx) :
+		min(m->m_nBands, m->m_bandIdx);
 }
 
 
@@ -1155,56 +1171,6 @@ HRESULT	Measure::DeviceInit()
 	}
 	if (!m_wfx) { m_wfx = &m_wfxR; }
 
-	pcmScalar = 1.0f / 0x7fff;
-
-	// setup FFT buffers
-	if (m_fftSize)
-	{
-		m_fftIn = (float*)calloc(m_fftSize * sizeof(float), 1);
-		m_fftKWdw = (float*)calloc(m_fftSize * sizeof(float), 1);
-		m_fftTmpIn = (float*)calloc(m_fftBufferSize * sizeof(float), 1);
-
-		m_fftCfg = kiss_fftr_alloc(m_fftBufferSize, 0, NULL, NULL);
-		m_fftTmpOut = (kiss_fft_cpx*)calloc(m_fftBufferSize * sizeof(kiss_fft_cpx), 1);
-
-		m_fftOut = (float*)calloc(m_fftBufferSize * sizeof(float), 1);
-
-		fftScalar = (float)(1.0 / sqrt(m_fftSize));
-
-		// zero-padding - https://jackschaedler.github.io/circles-sines-signals/zeropadding.html
-		for (int iBin = 0; iBin < m_fftBufferSize; ++iBin) m_fftTmpIn[iBin] = 0.0;
-
-		// calculate window function coefficients (http://en.wikipedia.org/wiki/Window_function#Hann_.28Hanning.29_window)
-		for (unsigned int iBin = 1; iBin < m_fftSize; ++iBin)
-			m_fftKWdw[iBin] = (float)(0.5 * (1.0 - cos(TWOPI * iBin / (m_fftSize + 1))));		// periodic version for FFT/spectral analysis
-		m_fftKWdw[0] = 0.0;
-	}
-
-	// calculate band frequencies and allocate band and wave output buffers
-	if (m_nBands)
-	{
-		m_bandFreq = (float*)malloc(m_nBands * sizeof(float));
-		const double step = (log(m_freqMax / m_freqMin) / m_nBands) / log(2.0);
-		m_bandFreq[0] = (float)(m_freqMin * pow(2.0, step));
-
-		df = (float)m_wfx->nSamplesPerSec / m_fftBufferSize;
-		dw = (float)m_fftSize / m_nBands;
-		bandScalar = 2.0f / (float)m_wfx->nSamplesPerSec;
-		smoothingScalar = (float)(1.0 / ((m_smoothing * 2) + 1));
-		waveScalar = (float)(1.0 / dw);
-
-		for (int iBand = 1; iBand < m_nBands; ++iBand)
-		{
-			m_bandFreq[iBand] = (float)(m_bandFreq[iBand - 1] * pow(2.0, step));
-		}
-
-		m_waveTmpOut2 = (float*)calloc(m_nBands * sizeof(float), 1);
-		m_waveTmpOut = (float*)calloc(m_fftSize * sizeof(float), 1);
-		m_bandTmpOut = (float*)calloc(m_nBands * sizeof(float), 1);
-		m_bandOut = (float*)calloc(m_nBands * sizeof(float), 1);
-		m_waveOut = (float*)calloc(m_nBands * sizeof(float), 1);
-	}
-
 	hr = m_clBugAudio->Initialize(
 		AUDCLNT_SHAREMODE_SHARED,
 		AUDCLNT_STREAMFLAGS_EVENTCALLBACK,		// "Each time the client receives an event for the render stream, it must signal the capture client to run"
@@ -1329,6 +1295,7 @@ HRESULT	Measure::DeviceInit()
 	}
 	EXIT_ON_ERROR(hr);
 
+	pcmScalar = 1.0f / 0x7fff;
 	m_bufChunk = (float*)calloc(nMaxFrames * m_wfx->nBlockAlign * sizeof(float), 1);
 
 	return S_OK;
