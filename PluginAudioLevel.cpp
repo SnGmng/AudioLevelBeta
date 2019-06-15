@@ -21,7 +21,7 @@
 #include <avrt.h>
 #pragma comment(lib, "Avrt.lib")
 
-#include "../../API/RainmeterAPI.h"
+#include "../API/RainmeterAPI.h"
 
 #include "kiss_fft130/kiss_fftr.h"
 
@@ -346,6 +346,9 @@ PLUGIN_EXPORT void Initialize(void** data, void* rm)
 		}
 	}
 
+	// create the enumerator
+	EXIT_ON_ERROR(CoCreateInstance(CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, IID_IMMDeviceEnumerator, (void**)&m->m_enum));
+
 	// parse requested device ID (optional)
 	LPCWSTR reqID = RmReadString(rm, L"ID", L"");
 	if (reqID)
@@ -353,19 +356,35 @@ PLUGIN_EXPORT void Initialize(void** data, void* rm)
 		_snwprintf_s(m->m_reqID, _TRUNCATE, L"%s", reqID);
 	}
 
-	// create the enumerator
-	if (CoCreateInstance(CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, IID_IMMDeviceEnumerator, (void**)&m->m_enum) == S_OK)
+	// if a specific ID was requested, search for that one, otherwise get the default
+	if (*m->m_reqID)
 	{
-		// init the device (if it fails, log debug message and quit)
-		if (m->DeviceInit() == S_OK)
+		HRESULT hr = m->m_enum->GetDevice(m->m_reqID, &m->m_dev);
+		if (hr != S_OK)
 		{
-			// create separate thread with event-driven update loop
-			std::thread thread(&Measure::DoCaptureLoop, m);
-			thread.detach();
+			WCHAR msg[256];
+			_snwprintf_s(msg, _TRUNCATE, L"Audio %s device '%s' not found (error 0x%08x).",
+				m->m_port == Measure::PORT_OUTPUT ? L"output" : L"input", m->m_reqID, hr);
+
+			RmLog(LOG_WARNING, msg);
 		}
+	}
+	else
+	{
+		EXIT_ON_ERROR(m->m_enum->GetDefaultAudioEndpoint(m->m_port == Measure::PORT_OUTPUT ? eRender : eCapture, eConsole, &m->m_dev));
+	}
+	
+	// init the device (if it fails, log debug message and quit)
+	if (m->DeviceInit() == S_OK) 
+	{
+		// create separate thread with event-driven update loop
+		std::thread thread(&Measure::DoCaptureLoop, m);
+		thread.detach();
 
 		return;
 	}
+	
+	Exit:
 
 	SAFE_RELEASE(m->m_enum);
 }
@@ -1098,27 +1117,7 @@ HRESULT	Measure::DeviceInit()
 	HRESULT hr;
 
 	// get the device handle
-	assert(m_enum && !m_dev);
-
-	// if a specific ID was requested, search for that one, otherwise get the default
-	if (*m_reqID)
-	{
-		hr = m_enum->GetDevice(m_reqID, &m_dev);
-		if (hr != S_OK)
-		{
-			WCHAR msg[256];
-			_snwprintf_s(msg, _TRUNCATE, L"Audio %s device '%s' not found (error 0x%08x).",
-				m_port == PORT_OUTPUT ? L"output" : L"input", m_reqID, hr);
-
-			RmLog(LOG_WARNING, msg);
-		}
-	}
-	else
-	{
-		hr = m_enum->GetDefaultAudioEndpoint(m_port == PORT_OUTPUT ? eRender : eCapture, eConsole, &m_dev);
-	}
-
-	EXIT_ON_ERROR(hr);
+	assert(m_enum && m_dev);
 
 	// store device name
 	IPropertyStore*	props = NULL;
@@ -1335,6 +1334,7 @@ HRESULT	Measure::DeviceInit()
 
 Exit:
 	DeviceRelease();
+	RmLogF(m_rm,LOG_ERROR, L"AudioLevel: Failed with HRESULT  %d", (int)hr);
 	return hr;
 }
 
