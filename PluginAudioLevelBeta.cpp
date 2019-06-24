@@ -21,7 +21,7 @@
 #include <avrt.h>
 #pragma comment(lib, "Avrt.lib")
 
-#include "../API/RainmeterAPI.h"
+#include "../../API/RainmeterAPI.h"
 
 #include "kiss_fft130/kiss_fftr.h"
 
@@ -164,13 +164,13 @@ struct Measure
 	float*					m_ringBuffer;				// ring buffer for audio data
 	float*					m_fftOut;					// buffer for FFT output
 	float*					m_fftKWdw;					// window function coefficients
-	float*					m_fftTmpIn;					// temp FFT processing buffer
+	float*					m_ringBufOut;				// buffer for audio data from the ring buffer
 	kiss_fft_cpx*			m_fftTmpOut;				// temp FFT processing buffer
 	int						m_ringBufW;					// write index for input ring buffers
 	float*					m_bandFreq;					// buffer of band max frequencies
 	float*					m_bandOut;					// buffer of band values
-	float*                  m_bandTmpOut;               // temp buffer of band values
-	float*                  m_waveBandOut;				// buffer of wave values
+	float*					m_bandTmpOut;               // temp buffer of band values
+	float*					m_waveBandOut;				// buffer of wave values
 	float*					m_waveOut;					// temp buffer of wave values
 	float*					m_waveBandTmpOut;			// 2nd temp buffer of wave values
 	float					m_df;						// delta freqency between two bins
@@ -188,10 +188,17 @@ struct Measure
 		m_fftSize(0),
 		m_fftBufferSize(0),
 		m_fftIdx(-1),
+		m_fftScalar(0),
 		m_nBands(0),
 		m_bandIdx(-1),
+		m_bandScalar(0),
+		m_df(0),
+		m_dw(0),
 		m_smoothing(0),
+		m_smoothingScalar(0),
 		m_waveSize(0),
+		m_waveIdx(0),
+		m_waveScalar(0),
 		m_ringBufferSize(0),
 		m_gainRMS(1.0),
 		m_gainPeak(1.0),
@@ -216,7 +223,7 @@ struct Measure
 		m_hStopEvent(NULL),
 		m_hTask(NULL),
 		m_fftKWdw(NULL),
-		m_fftTmpIn(NULL),
+		m_ringBufOut(NULL),
 		m_fftTmpOut(NULL),
 		m_ringBufW(0),
 		m_bandFreq(NULL)
@@ -347,7 +354,7 @@ PLUGIN_EXPORT void Initialize(void** data, void* rm)
 	}
 
 	// create the enumerator
-	EXIT_ON_ERROR(CoCreateInstance(CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, IID_IMMDeviceEnumerator, (void**)&m->m_enum));
+	EXIT_ON_ERROR(CoCreateInstance(CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, IID_IMMDeviceEnumerator, (void**)& m->m_enum));
 
 	// parse requested device ID (optional)
 	LPCWSTR reqID = RmReadString(rm, L"ID", L"");
@@ -373,9 +380,9 @@ PLUGIN_EXPORT void Initialize(void** data, void* rm)
 	{
 		EXIT_ON_ERROR(m->m_enum->GetDefaultAudioEndpoint(m->m_port == Measure::PORT_OUTPUT ? eRender : eCapture, eConsole, &m->m_dev));
 	}
-	
+
 	// init the device (if it fails, log debug message and quit)
-	if (m->DeviceInit() == S_OK) 
+	if (m->DeviceInit() == S_OK)
 	{
 		// create separate thread with event-driven update loop
 		std::thread thread(&Measure::DoCaptureLoop, m);
@@ -383,8 +390,8 @@ PLUGIN_EXPORT void Initialize(void** data, void* rm)
 
 		return;
 	}
-	
-	Exit:
+
+Exit:
 
 	SAFE_RELEASE(m->m_enum);
 }
@@ -536,13 +543,13 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 		int waveSize = RmReadInt(rm, L"WAVESize", m->m_waveSize);
 
 		// if one of these values changed, reinitialize
-		if (m->m_fftSize		!= fftSize ||
-			m->m_fftBufferSize	!= fftBufferSize ||
-			m->m_freqMin		!= freqMin ||
-			m->m_freqMax		!= freqMax ||
-			m->m_waveSize		!= waveSize ||
-			m->m_nBands			!= nBands ||
-			m->m_smoothing		!= smoothing)
+		if (m->m_fftSize != fftSize ||
+			m->m_fftBufferSize != fftBufferSize ||
+			m->m_freqMin != freqMin ||
+			m->m_freqMax != freqMax ||
+			m->m_waveSize != waveSize ||
+			m->m_nBands != nBands ||
+			m->m_smoothing != smoothing)
 		{
 			// initialize FFT data
 			if (m->m_fftSize < 0 || m->m_fftSize & 1)
@@ -581,13 +588,13 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 			if (m->m_ringBufferSize)
 			{
 				m->m_ringBuffer = (float*)calloc(m->m_ringBufferSize * sizeof(float), 1);
+				m->m_ringBufOut = (float*)calloc(m->m_ringBufferSize * sizeof(float), 1);
 			}
 
 			// setup FFT buffers
 			if (m->m_fftSize)
 			{
 				m->m_fftKWdw = (float*)calloc(m->m_fftSize * sizeof(float), 1);
-				m->m_fftTmpIn = (float*)calloc(m->m_fftBufferSize * sizeof(float), 1);
 
 				m->m_fftCfg = kiss_fftr_alloc(m->m_fftBufferSize, 0, NULL, NULL);
 				m->m_fftTmpOut = (kiss_fft_cpx*)calloc(m->m_fftBufferSize * sizeof(kiss_fft_cpx), 1);
@@ -597,7 +604,7 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 				m->m_fftScalar = (float)(1.0 / sqrt(m->m_fftSize));
 
 				// zero-padding - https://jackschaedler.github.io/circles-sines-signals/zeropadding.html
-				for (int iBin = 0; iBin < m->m_fftBufferSize; ++iBin) m->m_fftTmpIn[iBin] = 0.0;
+				for (int iBin = 0; iBin < m->m_fftBufferSize; ++iBin) m->m_ringBufOut[iBin] = 0.0;
 
 				// calculate window function coefficients (http://en.wikipedia.org/wiki/Window_function#Hann_.28Hanning.29_window)
 				for (unsigned int iBin = 1; iBin < m->m_fftSize; ++iBin)
@@ -606,7 +613,7 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 			}
 
 			// setup WAVE buffers
-			if (m->m_waveSize) 
+			if (m->m_waveSize)
 			{
 				m->m_dw = (float)m->m_waveSize / m->m_nBands;
 				m->m_waveScalar = (float)(1.0 / m->m_dw);
@@ -624,7 +631,7 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 
 				m->m_df = (float)m->m_wfx->nSamplesPerSec / m->m_fftBufferSize;
 				m->m_bandScalar = 2.0f / (float)m->m_wfx->nSamplesPerSec;
-				m->m_smoothingScalar = (float)(1.0 / ((m->m_smoothing * 2) + 1));
+				m->m_smoothingScalar = 1.0f / ((float)m->m_smoothing * 2.0f + 1.0f);
 
 				for (int iBand = 1; iBand < m->m_nBands; ++iBand)
 				{
@@ -701,7 +708,7 @@ PLUGIN_EXPORT double Update(void* data)
 
 	if (m->m_clCapture)
 	{
-		BYTE*  buffer;
+		BYTE* buffer;
 		UINT32 nFrames, nFramesNext;
 		DWORD  flags;
 
@@ -748,7 +755,7 @@ PLUGIN_EXPORT double Update(void* data)
 
 						// rms and peak values for sum channel
 						m->m_rms[Measure::CHANNEL_SUM] = m->m_wfx->nChannels >= 2
-							? (m->m_rms[Measure::CHANNEL_FL] + m->m_rms[Measure::CHANNEL_FR]) * 0.5
+							? (m->m_rms[Measure::CHANNEL_FL] + m->m_rms[Measure::CHANNEL_FR]) * 0.5f
 							: m->m_rms[Measure::CHANNEL_FL];
 
 						//RmLogF(m->m_rm, LOG_NOTICE, L"RMS CALCULATED, Channel %d: %f", 0, m->m_rms[0]);
@@ -789,22 +796,22 @@ PLUGIN_EXPORT double Update(void* data)
 			if (m->m_ringBufferSize)
 			{
 				// copy from the circular ring buffer to temp space
-				memcpy(&m->m_fftTmpIn[0], &m->m_ringBuffer[m->m_ringBufW], (m->m_ringBufferSize - m->m_ringBufW) * sizeof(float));
-				memcpy(&m->m_fftTmpIn[m->m_ringBufferSize - m->m_ringBufW], &m->m_ringBuffer[0], m->m_ringBufW * sizeof(float));
+				memcpy(&m->m_ringBufOut[0], &m->m_ringBuffer[m->m_ringBufW], (m->m_ringBufferSize - m->m_ringBufW) * sizeof(float));
+				memcpy(&m->m_ringBufOut[m->m_ringBufferSize - m->m_ringBufW], &m->m_ringBuffer[0], m->m_ringBufW * sizeof(float));
 
 				if (m->m_waveSize)
 				{
 					// copy waveform into wave output buffer
-					memcpy(&m->m_waveOut[0], &m->m_fftTmpIn[m->m_ringBufferSize-m->m_waveSize], m->m_waveSize * sizeof(float));
+					memcpy(&m->m_waveOut[0], &m->m_ringBufOut[m->m_ringBufferSize - m->m_waveSize], m->m_waveSize * sizeof(float));
 				}
 
 				if (m->m_fftSize)
 				{
 					// apply the windowing function
 					for (int iBin = m->m_ringBufferSize - m->m_fftSize; iBin < m->m_fftSize; ++iBin)
-						m->m_fftTmpIn[iBin] *= m->m_fftKWdw[iBin];
+						m->m_ringBufOut[iBin] *= m->m_fftKWdw[iBin];
 
-					kiss_fftr(m->m_fftCfg, &m->m_fftTmpIn[m->m_ringBufferSize - m->m_fftSize], m->m_fftTmpOut);
+					kiss_fftr(m->m_fftCfg, &m->m_ringBufOut[m->m_ringBufferSize - m->m_fftSize], m->m_fftTmpOut);
 
 					for (int iBin = 0; iBin < m->m_fftBufferSize; ++iBin)
 					{
@@ -842,7 +849,7 @@ PLUGIN_EXPORT double Update(void* data)
 						}
 						else
 						{
-							y += (wLin1 - w0) * (m->m_waveOut[iBin] + 0.5);
+							y += (bLin1 - w0) * (m->m_waveOut[iBin] + 0.5);
 							y *= m->m_waveScalar;
 							w0 = bLin1;
 							iBand += 1;
@@ -959,7 +966,7 @@ PLUGIN_EXPORT double Update(void* data)
 	case Measure::TYPE_FFTFREQ:
 		if (parent->m_clCapture && parent->m_fftBufferSize && m->m_fftIdx <= (parent->m_fftBufferSize * 0.5))
 		{
-			return (m->m_fftIdx * m->m_df);
+			return (float)m->m_fftIdx * m->m_df;
 		}
 		break;
 
@@ -976,7 +983,7 @@ PLUGIN_EXPORT double Update(void* data)
 		}
 		break;
 	case Measure::TYPE_RMS:
-		if (parent->m_clCapture && parent->m_rms) 
+		if (parent->m_clCapture && parent->m_rms)
 		{
 			return CLAMP01(sqrt(parent->m_rms[m->m_channel]) * parent->m_gainRMS);
 		}
@@ -1120,7 +1127,7 @@ HRESULT	Measure::DeviceInit()
 	assert(m_enum && m_dev);
 
 	// store device name
-	IPropertyStore*	props = NULL;
+	IPropertyStore* props = NULL;
 	if (m_dev->OpenPropertyStore(STGM_READ, &props) == S_OK)
 	{
 		PROPVARIANT	varName;
@@ -1137,7 +1144,7 @@ HRESULT	Measure::DeviceInit()
 	SAFE_RELEASE(props);
 
 	// get an extra audio client for loopback events
-	hr = m_dev->Activate(IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&m_clBugAudio);
+	hr = m_dev->Activate(IID_IAudioClient, CLSCTX_ALL, NULL, (void**)& m_clBugAudio);
 	if (hr != S_OK)
 	{
 		RmLog(LOG_WARNING, L"Failed to create audio client for loopback events.");
@@ -1146,7 +1153,7 @@ HRESULT	Measure::DeviceInit()
 	// get the main audio client
 	//if (m_dev->Activate(IID_IAudioClient3, CLSCTX_ALL, NULL, (void**)&m_clAudio) != S_OK)
 	//{
-	if (m_dev->Activate(IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&m_clAudio) != S_OK)
+	if (m_dev->Activate(IID_IAudioClient, CLSCTX_ALL, NULL, (void**)& m_clAudio) != S_OK)
 	{
 		RmLog(LOG_WARNING, L"Failed to create audio client.");
 		goto Exit;
@@ -1236,7 +1243,7 @@ HRESULT	Measure::DeviceInit()
 	// see: http://social.msdn.microsoft.com/Forums/windowsdesktop/en-US/c7ba0a04-46ce-43ff-ad15-ce8932c00171/loopback-recording-causes-digital-stuttering?forum=windowspro-audiodevelopment
 	if (m_port == PORT_OUTPUT)
 	{
-		hr = m_clBugAudio->GetService(IID_IAudioRenderClient, (void**)&m_clBugRender);
+		hr = m_clBugAudio->GetService(IID_IAudioRenderClient, (void**)& m_clBugRender);
 		EXIT_ON_ERROR(hr);
 
 		UINT32 nFrames;
@@ -1304,7 +1311,7 @@ HRESULT	Measure::DeviceInit()
 	}
 
 	// initialize the audio capture client
-	hr = m_clAudio->GetService(IID_IAudioCaptureClient, (void**)&m_clCapture);
+	hr = m_clAudio->GetService(IID_IAudioCaptureClient, (void**)& m_clCapture);
 	if (hr != S_OK)
 	{
 		RmLog(LOG_WARNING, L"Failed to create audio capture client.");
@@ -1334,7 +1341,7 @@ HRESULT	Measure::DeviceInit()
 
 Exit:
 	DeviceRelease();
-	RmLogF(m_rm,LOG_ERROR, L"AudioLevel: Failed with HRESULT  %d", (int)hr);
+	RmLogF(m_rm, LOG_ERROR, L"AudioLevel: Failed with HRESULT  %d", (int)hr);
 	return hr;
 }
 
@@ -1412,10 +1419,10 @@ void Measure::DeviceRelease()
 	if (m_fftTmpOut)
 	{
 		free(m_fftTmpOut);
-		free(m_fftTmpIn);
+		free(m_ringBufOut);
 		free(m_fftKWdw);
 		m_fftTmpOut = NULL;
-		m_fftTmpIn = NULL;
+		m_ringBufOut = NULL;
 		m_fftKWdw = NULL;
 		kiss_fft_cleanup();
 	}
