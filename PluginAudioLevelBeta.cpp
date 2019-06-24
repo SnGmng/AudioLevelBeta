@@ -1144,7 +1144,7 @@ HRESULT	Measure::DeviceInit()
 	SAFE_RELEASE(props);
 
 	// get an extra audio client for loopback events
-	hr = m_dev->Activate(IID_IAudioClient, CLSCTX_ALL, NULL, (void**)& m_clBugAudio);
+	hr = m_dev->Activate(IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&m_clBugAudio);
 	if (hr != S_OK)
 	{
 		RmLog(LOG_WARNING, L"Failed to create audio client for loopback events.");
@@ -1153,7 +1153,7 @@ HRESULT	Measure::DeviceInit()
 	// get the main audio client
 	//if (m_dev->Activate(IID_IAudioClient3, CLSCTX_ALL, NULL, (void**)&m_clAudio) != S_OK)
 	//{
-	if (m_dev->Activate(IID_IAudioClient, CLSCTX_ALL, NULL, (void**)& m_clAudio) != S_OK)
+	if (m_dev->Activate(IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&m_clAudio) != S_OK)
 	{
 		RmLog(LOG_WARNING, L"Failed to create audio client.");
 		goto Exit;
@@ -1243,7 +1243,7 @@ HRESULT	Measure::DeviceInit()
 	// see: http://social.msdn.microsoft.com/Forums/windowsdesktop/en-US/c7ba0a04-46ce-43ff-ad15-ce8932c00171/loopback-recording-causes-digital-stuttering?forum=windowspro-audiodevelopment
 	if (m_port == PORT_OUTPUT)
 	{
-		hr = m_clBugAudio->GetService(IID_IAudioRenderClient, (void**)& m_clBugRender);
+		hr = m_clBugAudio->GetService(IID_IAudioRenderClient, (void**)&m_clBugRender);
 		EXIT_ON_ERROR(hr);
 
 		UINT32 nFrames;
@@ -1311,7 +1311,7 @@ HRESULT	Measure::DeviceInit()
 	}
 
 	// initialize the audio capture client
-	hr = m_clAudio->GetService(IID_IAudioCaptureClient, (void**)& m_clCapture);
+	hr = m_clAudio->GetService(IID_IAudioCaptureClient, (void**)&m_clCapture);
 	if (hr != S_OK)
 	{
 		RmLog(LOG_WARNING, L"Failed to create audio capture client.");
