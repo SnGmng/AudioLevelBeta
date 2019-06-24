@@ -588,7 +588,7 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 			if (m->m_ringBufferSize)
 			{
 				m->m_ringBuffer = (float*)calloc(m->m_ringBufferSize * sizeof(float), 1);
-				m->m_ringBufOut = (float*)calloc(m->m_ringBufferSize * sizeof(float), 1);
+				m->m_ringBufOut = (float*)calloc(max(m->m_ringBufferSize, m->m_fftBufferSize) * sizeof(float), 1);
 			}
 
 			// setup FFT buffers
