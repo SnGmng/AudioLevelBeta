@@ -731,25 +731,6 @@ PLUGIN_EXPORT double Update(void* data)
 	Measure* m = (Measure*)data;
 	Measure* parent = m->m_parent ? m->m_parent : m;
 
-	/*
-	if (m_type == Measure::TYPE_BUFFERSTATUS && !FAILED(hr))
-	{
-		return nFramesNext > 0 ? nFramesNext : 0;
-	}*/
-
-	// Windows bug: sometimes when shutting down a playback application, it doesn't zero
-	// out the buffer.  Detect this by checking the time since the last successful fill
-	// and resetting the volumes if past the threshold.
-	/*
-	if (m->m_type == Measure::TYPE_RMS || m->m_type == Measure::TYPE_PEAK)
-	{
-		for (int iChan = 0; iChan < Measure::MAX_CHANNELS; ++iChan)
-		{
-			m->m_rms[iChan] = 0.0;
-			m->m_peak[iChan] = 0.0;
-		}
-	}*/
-
 	switch (m->m_type)
 	{
 	case Measure::TYPE_BAND:
@@ -1080,7 +1061,7 @@ HRESULT Measure::UpdateParent()
 				while (iBin <= m_waveSize && iBand < m_nBands)
 				{
 					const float wLin1 = iBin;
-					const float bLin1 = m_dw * iBand;
+					const float bLin1 = m_dw * (iBand + 1);
 					float& y = m_waveBandTmpOut[iBand];
 
 					if (wLin1 < bLin1)
