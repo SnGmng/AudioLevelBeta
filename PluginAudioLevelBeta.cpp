@@ -130,6 +130,8 @@ struct Measure
 	int                     m_smoothing;                // smoothing level (parsed from options)
 	int						m_waveSize;					// size of WAVE (parsed from options)
 	int						m_ringBufferSize;			// size of the ring buffer for FFT and WAVE
+	UINT32					m_nFramesNext;				// number of frames obtained on the UpdateParent call
+	UINT32					m_nSilentFrames;			// number of silent frames, used to calculate when to stop updating
 	double					m_gainRMS;					// RMS gain (parsed from options)
 	double					m_gainPeak;					// peak gain (parsed from options)
 	double					m_freqMin;					// min freq for band measurement
@@ -200,6 +202,8 @@ struct Measure
 		m_waveIdx(0),
 		m_waveScalar(0),
 		m_ringBufferSize(0),
+		m_nFramesNext(0),
+		m_nSilentFrames(0),
 		m_gainRMS(1.0),
 		m_gainPeak(1.0),
 		m_freqMin(20.0),
@@ -261,29 +265,9 @@ struct Measure
 
 	HRESULT DeviceInit();
 	void DeviceRelease();
+	HRESULT UpdateParent();
 
-	void DoCaptureLoop()
-	{
-		// register thread with MMCSS
-		DWORD nTaskIndex = 0;
-		m_hTask = AvSetMmThreadCharacteristics(L"Pro Audio", &nTaskIndex);
-		if (!(m_hTask && AvSetMmThreadPriority(m_hTask, AVRT_PRIORITY_CRITICAL)))
-		{
-			DWORD dwErr = GetLastError();
-			RmLog(LOG_WARNING, L"Failed to start multimedia task.");
-			return;
-		}
-
-		HANDLE waitArray[2] = { m_hReadyEvent, m_hStopEvent };
-
-		while (1)
-		{
-			if (WAIT_OBJECT_0 != WaitForMultipleObjects(ARRAYSIZE(waitArray), waitArray, FALSE, INFINITE))
-				return;
-
-			RmExecute(m_skin, MSG_UPDATE);
-		}
-	};
+	void DoCaptureLoop();
 };
 
 float pcmScalar = 1.0f / 0x7fff;
@@ -296,6 +280,47 @@ const IID IID_IAudioCaptureClient = __uuidof(IAudioCaptureClient);
 const IID IID_IAudioRenderClient = __uuidof(IAudioRenderClient);
 
 std::vector<Measure*> s_parents;
+
+void Measure::DoCaptureLoop() 
+{
+	// register thread with MMCSS
+	DWORD nTaskIndex = 0;
+	m_hTask = AvSetMmThreadCharacteristics(L"Pro Audio", &nTaskIndex);
+	if (!(m_hTask && AvSetMmThreadPriority(m_hTask, AVRT_PRIORITY_CRITICAL)))
+	{
+		DWORD dwErr = GetLastError();
+		RmLog(LOG_WARNING, L"Failed to start multimedia task.");
+		return;
+	}
+
+	HANDLE waitArray[2] = { m_hReadyEvent, m_hStopEvent };
+
+	while (1)
+	{
+		if (WAIT_OBJECT_0 != WaitForMultipleObjects(ARRAYSIZE(waitArray), waitArray, FALSE, INFINITE))
+			return;
+
+		// update parent seperated from measure update function
+		HRESULT hr = UpdateParent();
+
+		switch (hr)
+		{
+		case S_OK:
+			// everything is fine, update measures
+			RmExecute(m_skin, MSG_UPDATE);
+			break;
+		case S_FALSE:
+			// silence detected, no need to update
+			break;
+		case AUDCLNT_E_BUFFER_ERROR:
+		case AUDCLNT_E_DEVICE_INVALIDATED:
+		case AUDCLNT_E_SERVICE_NOT_RUNNING:
+			// error detected, release device
+			DeviceRelease();
+			break;
+		}
+	}
+}
 
 /**
 * Create and initialize a measure instance.  Creates WASAPI loopback
@@ -706,242 +731,24 @@ PLUGIN_EXPORT double Update(void* data)
 	Measure* m = (Measure*)data;
 	Measure* parent = m->m_parent ? m->m_parent : m;
 
-	if (m->m_clCapture)
+	/*
+	if (m_type == Measure::TYPE_BUFFERSTATUS && !FAILED(hr))
 	{
-		BYTE* buffer;
-		UINT32 nFrames, nFramesNext;
-		DWORD  flags;
+		return nFramesNext > 0 ? nFramesNext : 0;
+	}*/
 
-		HRESULT hr = m->m_clCapture->GetNextPacketSize(&nFramesNext);
-		if (hr == S_OK && nFramesNext > 0)
-		{
-			while (m->m_clCapture->GetBuffer(&buffer, &nFrames, &flags, NULL, NULL) == S_OK)
-			{
-				// if not F32, convert to F32
-				if (m->m_format == Measure::FMT_PCM_F32)
-				{
-					memcpy(&m->m_bufChunk[0], &buffer[0], nFrames * m->m_wfx->nBlockAlign);
-				}
-				else if (m->m_format == Measure::FMT_PCM_S16)
-				{
-					INT16* buf = (INT16*)buffer;
-					for (int iPcm = 0; iPcm < nFrames * m->m_wfx->nChannels; ++iPcm)
-					{
-						m->m_bufChunk[iPcm] = (float)buf[iPcm] * pcmScalar;
-					}
-				}
-
-				// release buffer immediately to resume capture
-				m->m_clCapture->ReleaseBuffer(nFrames);
-
-				// test for discontinuity or silence
-				if (flags == 0)
-				{
-					if (m->m_type == Measure::TYPE_RMS || m->m_type == Measure::TYPE_PEAK)
-					{
-						// measure RMS and peak levels
-						// loops unrolled for float, 16b and mono, stereo
-						for (int iFrame = 0; iFrame < nFrames * m->m_wfx->nChannels;)
-						{
-							for (int iChan = 0; iChan < m->m_wfx->nChannels; ++iChan)
-							{
-								float x = (float)m->m_bufChunk[iFrame++];
-								float sqrX = x * x;
-								float absX = abs(x);
-								m->m_rms[iChan] = sqrX + m->m_kRMS[(sqrX < m->m_rms[iChan])] * (m->m_rms[iChan] - sqrX);
-								m->m_peak[iChan] = absX + m->m_kPeak[(absX < m->m_peak[iChan])] * (m->m_peak[iChan] - absX);
-							}
-						}
-
-						// rms and peak values for sum channel
-						m->m_rms[Measure::CHANNEL_SUM] = m->m_wfx->nChannels >= 2
-							? (m->m_rms[Measure::CHANNEL_FL] + m->m_rms[Measure::CHANNEL_FR]) * 0.5f
-							: m->m_rms[Measure::CHANNEL_FL];
-
-						//RmLogF(m->m_rm, LOG_NOTICE, L"RMS CALCULATED, Channel %d: %f", 0, m->m_rms[0]);
-					}
-
-					// store data in ring buffers, and demux streams
-					if (m->m_ringBufferSize)
-					{
-						for (int iFrame = 0; iFrame < nFrames * m->m_wfx->nChannels;)
-						{
-							for (int iChan = 0; iChan < m->m_wfx->nChannels; ++iChan)
-							{
-								if (m->m_channel == Measure::CHANNEL_SUM)
-								{
-									if (iChan == Measure::CHANNEL_FL)
-									{
-										// cannot increment before evaluation
-										const float L = m->m_bufChunk[iFrame++];
-
-										// stereo to mono: (L + R) / 2
-										m->m_ringBuffer[m->m_ringBufW] = 0.5 * (L + m->m_bufChunk[iFrame++]);
-									}
-								}
-								else if (iChan == m->m_channel)
-								{
-									m->m_ringBuffer[m->m_ringBufW] = m->m_bufChunk[iFrame++];
-								}
-								else { ++iFrame; }	// move along the raw data buffer
-							}
-							m->m_ringBufW = (m->m_ringBufW + 1) % m->m_ringBufferSize;	// move along the data-to-process buffer
-						}
-					}
-				}
-				//else RmLog(LOG_WARNING, L"Silence or discontinuity detected.");
-			}
-
-			// process FFTs
-			if (m->m_ringBufferSize)
-			{
-				// copy from the circular ring buffer to temp space
-				memcpy(&m->m_ringBufOut[0], &m->m_ringBuffer[m->m_ringBufW], (m->m_ringBufferSize - m->m_ringBufW) * sizeof(float));
-				memcpy(&m->m_ringBufOut[m->m_ringBufferSize - m->m_ringBufW], &m->m_ringBuffer[0], m->m_ringBufW * sizeof(float));
-
-				if (m->m_waveSize)
-				{
-					// copy waveform into wave output buffer
-					memcpy(&m->m_waveOut[0], &m->m_ringBufOut[m->m_ringBufferSize - m->m_waveSize], m->m_waveSize * sizeof(float));
-				}
-
-				if (m->m_fftSize)
-				{
-					// apply the windowing function
-					for (int iBin = m->m_ringBufferSize - m->m_fftSize; iBin < m->m_fftSize; ++iBin)
-						m->m_ringBufOut[iBin] *= m->m_fftKWdw[iBin];
-
-					kiss_fftr(m->m_fftCfg, &m->m_ringBufOut[m->m_ringBufferSize - m->m_fftSize], m->m_fftTmpOut);
-
-					for (int iBin = 0; iBin < m->m_fftBufferSize; ++iBin)
-					{
-						// old and new values
-						float x0 = m->m_fftOut[iBin];
-						const float x1 = (m->m_fftTmpOut[iBin].r * m->m_fftTmpOut[iBin].r + m->m_fftTmpOut[iBin].i * m->m_fftTmpOut[iBin].i) * m->m_fftScalar;
-
-						x0 = x1 + m->m_kFFT[(x1 < x0)] * (x0 - x1);		// attack/decay filter
-						m->m_fftOut[iBin] = x0;
-					}
-				}
-			}
-
-			if (m->m_nBands)
-			{
-				// integrate waveform into lin-scale frequency bands
-				if (m->m_waveSize)
-				{
-					memset(m->m_waveBandOut, 0, m->m_nBands * sizeof(float));
-					int iBin = 0;
-					int iBand = 0;
-					float w0 = 0.0f;
-
-					while (iBin <= m->m_waveSize && iBand < m->m_nBands)
-					{
-						const float wLin1 = iBin;
-						const float bLin1 = m->m_dw * iBand;
-						float& y = m->m_waveBandTmpOut[iBand];
-
-						if (wLin1 < bLin1)
-						{
-							y += (wLin1 - w0) * (m->m_waveOut[iBin] + 0.5);
-							w0 = wLin1;
-							iBin += 1;
-						}
-						else
-						{
-							y += (bLin1 - w0) * (m->m_waveOut[iBin] + 0.5);
-							y *= m->m_waveScalar;
-							w0 = bLin1;
-							iBand += 1;
-						}
-					}
-
-					// smoothing
-					for (iBand = 0; iBand < m->m_nBands; iBand++)
-					{
-						float x = 0;
-						for (int s = -m->m_smoothing; s <= m->m_smoothing; s++)
-						{
-							x += m->m_waveBandTmpOut[(iBand + s <= 0) || (iBand + s >= m->m_nBands) ? iBand : iBand + s];
-						}
-						m->m_waveBandOut[iBand] = x * m->m_smoothingScalar;
-					}
-				}
-
-				// integrate FFT results into log-scale frequency bands
-				if (m->m_fftSize)
-				{
-					memset(m->m_bandTmpOut, 0, m->m_nBands * sizeof(float));
-					int iBin = (int)((m->m_freqMin / m->m_df));
-					int iBand = 0;
-					float f0 = m->m_freqMin;
-
-					while (iBin <= (m->m_fftBufferSize * 0.5) && iBand < m->m_nBands)
-					{
-						const float fLin1 = ((float)iBin) * m->m_df;
-						const float fLog1 = m->m_bandFreq[iBand];
-						float& y = m->m_bandTmpOut[iBand];
-
-						if (fLin1 <= fLog1)
-						{
-							y += (fLin1 - f0) * m->m_fftOut[iBin] * m->m_bandScalar;
-							f0 = fLin1;
-							iBin += 1;
-						}
-						else
-						{
-							y += (fLog1 - f0) * m->m_fftOut[iBin] * m->m_bandScalar;
-							f0 = fLog1;
-							iBand += 1;
-						}
-					}
-
-					// sensivity
-					for (iBand = 0; iBand < m->m_nBands; iBand++)
-					{
-						m->m_bandTmpOut[iBand] = max(0, m->m_sensitivity * log10(CLAMP01(m->m_bandTmpOut[iBand])) + 1.0);
-					}
-
-					// smoothing
-					for (iBand = 0; iBand < m->m_nBands; iBand++)
-					{
-						float x = 0;
-						for (int s = -m->m_smoothing; s <= m->m_smoothing; s++)
-						{
-							x += m->m_bandTmpOut[(iBand + s <= 0) || (iBand + s >= m->m_nBands) ? iBand : iBand + s];
-						}
-						m->m_bandOut[iBand] = x * m->m_smoothingScalar;
-					}
-				}
-			}
-		}
-
-		if (m->m_type == Measure::TYPE_BUFFERSTATUS && !FAILED(hr))
-		{
-			return nFramesNext > 0 ? nFramesNext : 0;
-		}
-
-		// detect device disconnection
-		switch (hr)
-		{
-		case AUDCLNT_E_BUFFER_ERROR:
-		case AUDCLNT_E_DEVICE_INVALIDATED:
-		case AUDCLNT_E_SERVICE_NOT_RUNNING:
-			m->DeviceRelease();
-			break;
-		}
-	}
 	// Windows bug: sometimes when shutting down a playback application, it doesn't zero
 	// out the buffer.  Detect this by checking the time since the last successful fill
 	// and resetting the volumes if past the threshold.
-	else if (m->m_type == Measure::TYPE_RMS || m->m_type == Measure::TYPE_PEAK)
+	/*
+	if (m->m_type == Measure::TYPE_RMS || m->m_type == Measure::TYPE_PEAK)
 	{
 		for (int iChan = 0; iChan < Measure::MAX_CHANNELS; ++iChan)
 		{
 			m->m_rms[iChan] = 0.0;
 			m->m_peak[iChan] = 0.0;
 		}
-	}
+	}*/
 
 	switch (m->m_type)
 	{
@@ -1002,6 +809,12 @@ PLUGIN_EXPORT double Update(void* data)
 			{
 				return 1.0;
 			}
+		}
+		break;
+	case Measure::TYPE_BUFFERSTATUS:
+		if (parent->m_nFramesNext > 0)
+		{
+			return parent->m_nFramesNext;
 		}
 		break;
 	}
@@ -1111,6 +924,241 @@ PLUGIN_EXPORT LPCWSTR GetString(void* data)
 	}
 
 	return buffer;
+}
+
+HRESULT Measure::UpdateParent()
+{
+	BYTE* buffer;
+	UINT32 nFrames, m_nFramesNext;
+	DWORD  flags;
+
+	HRESULT hr = m_clCapture->GetNextPacketSize(&m_nFramesNext);
+	if (hr == S_OK)
+	{
+		if (m_nFramesNext <= 0) return S_FALSE;
+		
+		while (m_clCapture->GetBuffer(&buffer, &nFrames, &flags, NULL, NULL) == S_OK)
+		{
+			// if not F32, convert to F32
+			if (m_format == Measure::FMT_PCM_F32)
+			{
+				memcpy(&m_bufChunk[0], &buffer[0], nFrames * m_wfx->nBlockAlign);
+			}
+			else if (m_format == Measure::FMT_PCM_S16)
+			{
+				INT16* buf = (INT16*)buffer;
+				for (int iPcm = 0; iPcm < nFrames * m_wfx->nChannels; ++iPcm)
+				{
+					m_bufChunk[iPcm] = (float)buf[iPcm] * pcmScalar;
+				}
+			}
+
+			// release buffer immediately to resume capture
+			m_clCapture->ReleaseBuffer(nFrames);
+
+			// test for discontinuity or silence
+			if (flags & AUDCLNT_BUFFERFLAGS_SILENT) 
+			{
+				// is the ring buffer filled with silence? then stop updating
+				if (m_nSilentFrames > m_ringBufferSize) 
+				{
+					return S_FALSE;
+				}
+				else 
+				{
+					m_nSilentFrames += nFrames;
+				}
+			}
+			else if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY)
+			{
+				// not sure what to do with those frames... ignore them? use them? treat as silent frames?
+				// for now, ignore.
+				continue;
+			}
+			else 
+			{
+				// audio data is not silent, reset silent frames counter
+				m_nSilentFrames = 0;
+			}
+
+			if (m_type == Measure::TYPE_RMS || m_type == Measure::TYPE_PEAK)
+			{
+				// measure RMS and peak levels
+				// loops unrolled for float, 16b and mono, stereo
+				for (int iFrame = 0; iFrame < nFrames * m_wfx->nChannels;)
+				{
+					for (int iChan = 0; iChan < m_wfx->nChannels; ++iChan)
+					{
+						float x = (float)m_bufChunk[iFrame++];
+						float sqrX = x * x;
+						float absX = abs(x);
+						m_rms[iChan] = sqrX + m_kRMS[(sqrX < m_rms[iChan])] * (m_rms[iChan] - sqrX);
+						m_peak[iChan] = absX + m_kPeak[(absX < m_peak[iChan])] * (m_peak[iChan] - absX);
+					}
+				}
+
+				// rms and peak values for sum channel
+				m_rms[Measure::CHANNEL_SUM] = m_wfx->nChannels >= 2
+					? (m_rms[Measure::CHANNEL_FL] + m_rms[Measure::CHANNEL_FR]) * 0.5f
+					: m_rms[Measure::CHANNEL_FL];
+
+				//RmLogF(m_rm, LOG_NOTICE, L"RMS CALCULATED, Channel %d: %f", 0, m_rms[0]);
+			}
+
+			// store data in ring buffers, and demux streams
+			if (m_ringBufferSize)
+			{
+				for (int iFrame = 0; iFrame < nFrames * m_wfx->nChannels;)
+				{
+					for (int iChan = 0; iChan < m_wfx->nChannels; ++iChan)
+					{
+						if (m_channel == Measure::CHANNEL_SUM)
+						{
+							if (iChan == Measure::CHANNEL_FL)
+							{
+								// cannot increment before evaluation
+								const float L = m_bufChunk[iFrame++];
+
+								// stereo to mono: (L + R) / 2
+								m_ringBuffer[m_ringBufW] = 0.5 * (L + m_bufChunk[iFrame++]);
+							}
+						}
+						else if (iChan == m_channel)
+						{
+							m_ringBuffer[m_ringBufW] = m_bufChunk[iFrame++];
+						}
+						else { ++iFrame; }	// move along the raw data buffer
+					}
+					m_ringBufW = (m_ringBufW + 1) % m_ringBufferSize;	// move along the data-to-process buffer
+				}
+			}
+		}
+
+		// process FFTs
+		if (m_ringBufferSize)
+		{
+			// copy from the circular ring buffer to temp space
+			memcpy(&m_ringBufOut[0], &m_ringBuffer[m_ringBufW], (m_ringBufferSize - m_ringBufW) * sizeof(float));
+			memcpy(&m_ringBufOut[m_ringBufferSize - m_ringBufW], &m_ringBuffer[0], m_ringBufW * sizeof(float));
+
+			if (m_waveSize)
+			{
+				// copy waveform into wave output buffer
+				memcpy(&m_waveOut[0], &m_ringBufOut[m_ringBufferSize - m_waveSize], m_waveSize * sizeof(float));
+			}
+
+			if (m_fftSize)
+			{
+				// apply the windowing function
+				for (int iBin = m_ringBufferSize - m_fftSize; iBin < m_fftSize; ++iBin)
+					m_ringBufOut[iBin] *= m_fftKWdw[iBin];
+
+				kiss_fftr(m_fftCfg, &m_ringBufOut[m_ringBufferSize - m_fftSize], m_fftTmpOut);
+
+				for (int iBin = 0; iBin < m_fftBufferSize; ++iBin)
+				{
+					// old and new values
+					float x0 = m_fftOut[iBin];
+					const float x1 = (m_fftTmpOut[iBin].r * m_fftTmpOut[iBin].r + m_fftTmpOut[iBin].i * m_fftTmpOut[iBin].i) * m_fftScalar;
+
+					x0 = x1 + m_kFFT[(x1 < x0)] * (x0 - x1);		// attack/decay filter
+					m_fftOut[iBin] = x0;
+				}
+			}
+		}
+
+		if (m_nBands)
+		{
+			// integrate waveform into lin-scale frequency bands
+			if (m_waveSize)
+			{
+				memset(m_waveBandOut, 0, m_nBands * sizeof(float));
+				int iBin = 0;
+				int iBand = 0;
+				float w0 = 0.0f;
+
+				while (iBin <= m_waveSize && iBand < m_nBands)
+				{
+					const float wLin1 = iBin;
+					const float bLin1 = m_dw * iBand;
+					float& y = m_waveBandTmpOut[iBand];
+
+					if (wLin1 < bLin1)
+					{
+						y += (wLin1 - w0) * (m_waveOut[iBin] + 0.5);
+						w0 = wLin1;
+						iBin += 1;
+					}
+					else
+					{
+						y += (bLin1 - w0) * (m_waveOut[iBin] + 0.5);
+						y *= m_waveScalar;
+						w0 = bLin1;
+						iBand += 1;
+					}
+				}
+
+				// smoothing
+				for (iBand = 0; iBand < m_nBands; iBand++)
+				{
+					float x = 0;
+					for (int s = -m_smoothing; s <= m_smoothing; s++)
+					{
+						x += m_waveBandTmpOut[(iBand + s <= 0) || (iBand + s >= m_nBands) ? iBand : iBand + s];
+					}
+					m_waveBandOut[iBand] = x * m_smoothingScalar;
+				}
+			}
+
+			// integrate FFT results into log-scale frequency bands
+			if (m_fftSize)
+			{
+				memset(m_bandTmpOut, 0, m_nBands * sizeof(float));
+				int iBin = (int)((m_freqMin / m_df));
+				int iBand = 0;
+				float f0 = m_freqMin;
+
+				while (iBin <= (m_fftBufferSize * 0.5) && iBand < m_nBands)
+				{
+					const float fLin1 = ((float)iBin) * m_df;
+					const float fLog1 = m_bandFreq[iBand];
+					float& y = m_bandTmpOut[iBand];
+
+					if (fLin1 <= fLog1)
+					{
+						y += (fLin1 - f0) * m_fftOut[iBin] * m_bandScalar;
+						f0 = fLin1;
+						iBin += 1;
+					}
+					else
+					{
+						y += (fLog1 - f0) * m_fftOut[iBin] * m_bandScalar;
+						f0 = fLog1;
+						iBand += 1;
+					}
+				}
+
+				// sensivity
+				for (iBand = 0; iBand < m_nBands; iBand++)
+				{
+					m_bandTmpOut[iBand] = max(0, m_sensitivity * log10(CLAMP01(m_bandTmpOut[iBand])) + 1.0);
+				}
+
+				// smoothing
+				for (iBand = 0; iBand < m_nBands; iBand++)
+				{
+					float x = 0;
+					for (int s = -m_smoothing; s <= m_smoothing; s++)
+					{
+						x += m_bandTmpOut[(iBand + s <= 0) || (iBand + s >= m_nBands) ? iBand : iBand + s];
+					}
+					m_bandOut[iBand] = x * m_smoothingScalar;
+				}
+			}
+		}
+	}
+
+	return hr;
 }
 
 
