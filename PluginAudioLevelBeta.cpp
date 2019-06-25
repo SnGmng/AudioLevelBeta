@@ -563,8 +563,8 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 		int fftBufferSize = max(m->m_fftSize, RmReadInt(rm, L"FFTBufferSize", m->m_fftBufferSize));
 		int nBands = RmReadInt(rm, L"Bands", m->m_nBands);
 		int smoothing = max(0, RmReadInt(rm, L"Smoothing", m->m_smoothing));
-		int freqMin = max(0.0, RmReadDouble(rm, L"FreqMin", m->m_freqMin));
-		int freqMax = max(0.0, RmReadDouble(rm, L"FreqMax", m->m_freqMax));
+		double freqMin = max(0.0, RmReadDouble(rm, L"FreqMin", m->m_freqMin));
+		double freqMax = max(0.0, RmReadDouble(rm, L"FreqMax", m->m_freqMax));
 		int waveSize = RmReadInt(rm, L"WAVESize", m->m_waveSize);
 
 		// if one of these values changed, reinitialize
@@ -1110,13 +1110,13 @@ HRESULT Measure::UpdateParent()
 
 					if (wLin1 < bLin1)
 					{
-						y += (wLin1 - w0) * (m_waveOut[iBin] * 0.5 + 0.5);
+						y += (wLin1 - w0) * (m_waveOut[iBin] * 0.5f + 0.5f);
 						w0 = wLin1;
 						iBin += 1;
 					}
 					else
 					{
-						y += (bLin1 - w0) * (m_waveOut[iBin] * 0.5 + 0.5);
+						y += (bLin1 - w0) * (m_waveOut[iBin] * 0.5f + 0.5f);
 						y *= m_waveScalar;
 						w0 = bLin1;
 						iBand += 1;
@@ -1129,7 +1129,7 @@ HRESULT Measure::UpdateParent()
 					float x = 0;
 					for (int s = -m_smoothing; s <= m_smoothing; s++)
 					{
-						x += (iBand + s < 0) || (iBand + s >= m_nBands) ? 0.5 : m_waveBandTmpOut[iBand + s];
+						x += (iBand + s < 0) || (iBand + s >= m_nBands) ? 0.5f : m_waveBandTmpOut[iBand + s];
 					}
 					m_waveBandOut[iBand] = x * m_smoothingScalar;
 				}
@@ -1143,7 +1143,7 @@ HRESULT Measure::UpdateParent()
 				int iBand = 0;
 				float f0 = m_freqMin;
 
-				while (iBin <= (m_fftBufferSize * 0.5) && iBand < m_nBands)
+				while (iBin <= (m_fftBufferSize * 0.5f) && iBand < m_nBands)
 				{
 					const float fLin1 = ((float)iBin) * m_df;
 					const float fLog1 = m_bandFreq[iBand];
