@@ -55,7 +55,6 @@ Channel=R
 #define EXIT_ON_ERROR(hres)		if (FAILED(hres)) { goto Exit; }
 #define SAFE_RELEASE(p)			if ((p) != NULL) { (p)->Release(); (p) = NULL; }
 #define CLAMP01(x)				max(0.0, min(1.0, (x)))
-#define MSG_UPDATE				L"!UpdateMeasure Audio"
 
 struct Measure
 {
@@ -108,6 +107,12 @@ struct Measure
 		NUM_FORMATS
 	};
 
+	enum UpdateCycle
+	{
+		UPDC_RAINMETER,
+		UPDC_AUDIOLEVEL
+	};
+
 	struct BandInfo
 	{
 		float freq;
@@ -118,6 +123,7 @@ struct Measure
 	Channel					m_channel;					// channel specifier (parsed from options)
 	Type					m_type;						// data type specifier (parsed from options)
 	Format					m_format;					// format specifier (detected in init)
+	UpdateCycle				m_updCycle;					// update cycle specifier (parsed from options)
 	int						m_envRMS[2];				// RMS attack/decay times in ms (parsed from options)
 	int						m_envPeak[2];				// peak attack/decay times in ms (parsed from options)
 	int						m_envFFT[2];				// FFT attack/decay times in ms (parsed from options)
@@ -154,8 +160,10 @@ struct Measure
 	HANDLE					m_hReadyEvent;				// buffer-event handle to receive notifications
 	HANDLE					m_hStopEvent;				// skin closed handle to receive notifications
 	HANDLE					m_hTask;					// Multimedia Class Scheduler Service task
+	std::thread*			m_updateLoopThread;			// thread for running the update loop
 	WCHAR					m_reqID[64];				// requested device ID (parsed from options)
 	WCHAR					m_devName[64];				// device friendly name (detected in init)
+	WCHAR					m_msgUpdate[256];			// rainmeter update command
 	float					m_kRMS[2];					// RMS attack/decay filter constants
 	float					m_kPeak[2];					// peak attack/decay filter constants
 	float					m_kFFT[2];					// FFT attack/decay filter constants
@@ -187,6 +195,7 @@ struct Measure
 		m_channel(CHANNEL_SUM),
 		m_type(TYPE_RMS),
 		m_format(FMT_INVALID),
+		m_updCycle(UPDC_AUDIOLEVEL),
 		m_fftSize(0),
 		m_fftBufferSize(0),
 		m_fftIdx(-1),
@@ -226,6 +235,7 @@ struct Measure
 		m_hReadyEvent(NULL),
 		m_hStopEvent(NULL),
 		m_hTask(NULL),
+		m_updateLoopThread(NULL),
 		m_fftKWdw(NULL),
 		m_ringBufOut(NULL),
 		m_fftTmpOut(NULL),
@@ -240,6 +250,7 @@ struct Measure
 		m_envFFT[1] = 300;
 		m_reqID[0] = '\0';
 		m_devName[0] = '\0';
+		m_msgUpdate[0] = '\0';
 		m_kRMS[0] = 0.0f;
 		m_kRMS[1] = 0.0f;
 		m_kPeak[0] = 0.0f;
@@ -281,7 +292,7 @@ const IID IID_IAudioRenderClient = __uuidof(IAudioRenderClient);
 
 std::vector<Measure*> s_parents;
 
-void Measure::DoCaptureLoop() 
+void Measure::DoCaptureLoop()
 {
 	// register thread with MMCSS
 	DWORD nTaskIndex = 0;
@@ -307,7 +318,7 @@ void Measure::DoCaptureLoop()
 		{
 		case S_OK:
 			// everything is fine, update measures
-			RmExecute(m_skin, MSG_UPDATE);
+			RmExecute(m_skin, m_msgUpdate);
 			break;
 		case S_FALSE:
 			// silence detected, no need to update
@@ -378,6 +389,29 @@ PLUGIN_EXPORT void Initialize(void** data, void* rm)
 		}
 	}
 
+	// parse update cycle specifier
+	LPCWSTR updCycle = RmReadString(rm, L"UpdateCycle", L"");
+	if (updCycle && *updCycle)
+	{
+		if (_wcsicmp(updCycle, L"Rainmeter") == 0)
+		{
+			// use the update cycle of rainmeter (update when measure update)
+			// for slow PCs
+			m->m_updCycle = Measure::UPDC_RAINMETER;
+		}
+		else if (_wcsicmp(updCycle, L"Audiolevel") == 0)
+		{
+			// use the update cycle of wasapi (update when audio data ready)
+			m->m_updCycle = Measure::UPDC_AUDIOLEVEL;
+		}
+		else
+		{
+			RmLogF(rm, LOG_ERROR, L"Invalid update cycle '%s', must be one of: Rainmeter or Audiolevel.", port);
+		}
+	}
+
+	_snwprintf_s(m->m_msgUpdate, _TRUNCATE, L"!UpdateMeasure %s", m->m_rmName);
+
 	// create the enumerator
 	EXIT_ON_ERROR(CoCreateInstance(CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, IID_IMMDeviceEnumerator, (void**)& m->m_enum));
 
@@ -409,10 +443,6 @@ PLUGIN_EXPORT void Initialize(void** data, void* rm)
 	// init the device (if it fails, log debug message and quit)
 	if (m->DeviceInit() == S_OK)
 	{
-		// create separate thread with event-driven update loop
-		std::thread thread(&Measure::DoCaptureLoop, m);
-		thread.detach();
-
 		return;
 	}
 
@@ -502,7 +532,7 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 			}
 		}
 
-		if (!(iType < Measure::NUM_TYPES))
+		if (iType >= Measure::NUM_TYPES)
 		{
 			WCHAR msg[512];
 			WCHAR* d = msg;
@@ -524,21 +554,20 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 	LPCWSTR channel = RmReadString(rm, L"Channel", L"");
 	if (*channel)
 	{
-		bool found = false;
-		for (int iChan = 0; iChan <= Measure::CHANNEL_SUM && !found; ++iChan)
+		int iChan;
+		for (iChan = 0; iChan < Measure::MAX_CHANNELS; ++iChan)
 		{
 			for (int j = 0; j < 3; ++j)
 			{
 				if (_wcsicmp(channel, s_chanName[iChan][j]) == 0)
 				{
 					m->m_channel = (Measure::Channel)iChan;
-					found = true;
 					break;
 				}
 			}
 		}
 
-		if (!found)
+		if (iChan >= Measure::MAX_CHANNELS)
 		{
 			WCHAR msg[512];
 			WCHAR* d = msg;
@@ -605,7 +634,12 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 
 			// initialize smoothing
 			m->m_smoothing = smoothing;
+			if (m->m_smoothing)
+			{
+				m->m_smoothingScalar = 1.0f / ((float)m->m_smoothing * 2.0f + 1.0f);
+			}
 
+			// initialize min/max frequency
 			m->m_freqMin = freqMin;
 			m->m_freqMax = freqMax;
 
@@ -627,6 +661,7 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 				m->m_fftOut = (float*)calloc(m->m_fftBufferSize * sizeof(float), 1);
 
 				m->m_fftScalar = (float)(1.0 / sqrt(m->m_fftSize));
+				m->m_df = (float)m->m_wfx->nSamplesPerSec / m->m_fftBufferSize;
 
 				// zero-padding - https://jackschaedler.github.io/circles-sines-signals/zeropadding.html
 				for (int iBin = 0; iBin < m->m_fftBufferSize; ++iBin) m->m_ringBufOut[iBin] = 0.0;
@@ -635,36 +670,46 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 				for (unsigned int iBin = 1; iBin < m->m_fftSize; ++iBin)
 					m->m_fftKWdw[iBin] = (float)(0.5 * (1.0 - cos(TWOPI * iBin / (m->m_fftSize + 1))));		// periodic version for FFT/spectral analysis
 				m->m_fftKWdw[0] = 0.0;
+
+				// calculate band frequencies and allocate band output buffers
+				if (m->m_nBands)
+				{
+					m->m_bandFreq = (float*)malloc(m->m_nBands * sizeof(float));
+					const double step = pow(2.0, (log(m->m_freqMax / m->m_freqMin) / m->m_nBands) / log(2.0));
+					m->m_bandFreq[0] = (float)(m->m_freqMin * step);
+
+					m->m_bandScalar = 2.0f / (float)m->m_wfx->nSamplesPerSec;
+					m->m_bandOut = (float*)calloc(m->m_nBands * sizeof(float), 1);
+
+					for (int iBand = 1; iBand < m->m_nBands; ++iBand)
+					{
+						m->m_bandFreq[iBand] = (float)(m->m_bandFreq[iBand - 1] * step);
+					}
+
+					if (m->m_smoothing) 
+					{
+						m->m_bandTmpOut = (float*)calloc(m->m_nBands * sizeof(float), 1);
+					}
+				}
 			}
 
 			// setup WAVE buffers
 			if (m->m_waveSize)
 			{
-				m->m_dw = (float)m->m_waveSize / (float)m->m_nBands;
-				m->m_waveScalar = (float)(1.0f / m->m_dw);
-				m->m_waveBandOut = (float*)calloc(m->m_nBands * sizeof(float), 1);
-				m->m_waveBandTmpOut = (float*)calloc(m->m_nBands * sizeof(float), 1);
 				m->m_waveOut = (float*)calloc(m->m_waveSize * sizeof(float), 1);
-			}
 
-			// calculate band frequencies and allocate band output buffers
-			if (m->m_nBands)
-			{
-				m->m_bandFreq = (float*)malloc(m->m_nBands * sizeof(float));
-				const double step = pow(2.0, (log(m->m_freqMax / m->m_freqMin) / m->m_nBands) / log(2.0));
-				m->m_bandFreq[0] = (float)(m->m_freqMin * step);
-
-				m->m_df = (float)m->m_wfx->nSamplesPerSec / m->m_fftBufferSize;
-				m->m_bandScalar = 2.0f / (float)m->m_wfx->nSamplesPerSec;
-				m->m_smoothingScalar = 1.0f / ((float)m->m_smoothing * 2.0f + 1.0f);
-
-				for (int iBand = 1; iBand < m->m_nBands; ++iBand)
+				if (m->m_nBands)
 				{
-					m->m_bandFreq[iBand] = (float)(m->m_bandFreq[iBand - 1] * step);
-				}
+					m->m_dw = (float)m->m_waveSize / (float)m->m_nBands;
+					m->m_waveScalar = (float)(1.0f / m->m_dw);
+					m->m_waveBandOut = (float*)calloc(m->m_nBands * sizeof(float), 1);
 
-				m->m_bandTmpOut = (float*)calloc(m->m_nBands * sizeof(float), 1);
-				m->m_bandOut = (float*)calloc(m->m_nBands * sizeof(float), 1);
+					// smoothing needs an additional temp buffer
+					if (m->m_smoothing)
+					{
+						m->m_waveBandTmpOut = (float*)calloc(m->m_nBands * sizeof(float), 1);
+					}
+				}
 			}
 		}
 
@@ -698,6 +743,14 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 				m->m_kFFT[1] = (float)exp(log10(0.01) / (freq * 0.001 * (double)m->m_envFFT[1] * 0.001));
 			}
 		}
+
+		if (!m->m_updateLoopThread && m->m_updCycle == Measure::UPDC_AUDIOLEVEL)
+		{
+			RmLogF(rm, LOG_DEBUG, L"Creating Thread");
+			// create separate thread with event-driven update loop
+			m->m_updateLoopThread = new std::thread(&Measure::DoCaptureLoop, m);
+			m->m_updateLoopThread->detach();
+		}
 	}
 
 	// parse FFT index request
@@ -730,6 +783,28 @@ PLUGIN_EXPORT double Update(void* data)
 {
 	Measure* m = (Measure*)data;
 	Measure* parent = m->m_parent ? m->m_parent : m;
+
+
+	if (!m->m_parent && m->m_updCycle == Measure::UPDC_RAINMETER)
+	{
+		HRESULT hr = m->UpdateParent();
+
+		switch (hr)
+		{
+		case S_OK:
+			// everything is fine, update measures
+			break;
+		case S_FALSE:
+			// silence detected, no need to update
+			return 0.0;
+		case AUDCLNT_E_BUFFER_ERROR:
+		case AUDCLNT_E_DEVICE_INVALIDATED:
+		case AUDCLNT_E_SERVICE_NOT_RUNNING:
+			// error detected, release device
+			m->DeviceRelease();
+			return 0.0;
+		}
+	}
 
 	switch (m->m_type)
 	{
@@ -1097,16 +1172,19 @@ HRESULT Measure::UpdateParent()
 			// integrate waveform into lin-scale frequency bands
 			if (m_waveSize)
 			{
-				memset(m_waveBandTmpOut, 0, m_nBands * sizeof(float));
 				int iBin = 0;
 				int iBand = 0;
 				float w0 = 0.0f;
+
+				// use a temp buffer if smoothing is enabled, otherwise skip temp buffer
+				float* ptrWaveBuffer = m_smoothing ? m_waveBandTmpOut : m_waveBandOut;
+				memset(ptrWaveBuffer, 0, m_nBands * sizeof(float));
 
 				while (iBin <= m_waveSize && iBand < m_nBands)
 				{
 					const float wLin1 = iBin;
 					const float bLin1 = m_dw * (iBand + 1);
-					float& y = m_waveBandTmpOut[iBand];
+					float& y = ptrWaveBuffer[iBand];
 
 					if (wLin1 < bLin1)
 					{
@@ -1124,30 +1202,37 @@ HRESULT Measure::UpdateParent()
 				}
 
 				// smoothing
-				for (iBand = 0; iBand < m_nBands; iBand++)
+				// calculate the average of the band indexes iBand-n to iBand+n (n = m_smoothing)
+				if (m_smoothing)
 				{
-					float x = 0;
-					for (int s = -m_smoothing; s <= m_smoothing; s++)
+					for (iBand = 0; iBand < m_nBands; iBand++)
 					{
-						x += (iBand + s < 0) || (iBand + s >= m_nBands) ? 0.5f : m_waveBandTmpOut[iBand + s];
+						float x = 0;
+						for (int s = -m_smoothing; s <= m_smoothing; s++)
+						{
+							x += (iBand + s < 0) || (iBand + s >= m_nBands) ? 0.5f : m_waveBandTmpOut[iBand + s];
+						}
+						m_waveBandOut[iBand] = x * m_smoothingScalar;
 					}
-					m_waveBandOut[iBand] = x * m_smoothingScalar;
 				}
 			}
 
 			// integrate FFT results into log-scale frequency bands
 			if (m_fftSize)
 			{
-				memset(m_bandTmpOut, 0, m_nBands * sizeof(float));
 				int iBin = (int)((m_freqMin / m_df));
 				int iBand = 0;
 				float f0 = m_freqMin;
+
+				// use a temp buffer if smoothing is enabled, otherwise skip temp buffer
+				float* ptrBandBuffer = m_smoothing ? m_bandTmpOut : m_bandOut;
+				memset(ptrBandBuffer, 0, m_nBands * sizeof(float));
 
 				while (iBin <= (m_fftBufferSize * 0.5f) && iBand < m_nBands)
 				{
 					const float fLin1 = ((float)iBin) * m_df;
 					const float fLog1 = m_bandFreq[iBand];
-					float& y = m_bandTmpOut[iBand];
+					float& y = ptrBandBuffer[iBand];
 
 					if (fLin1 <= fLog1)
 					{
@@ -1164,21 +1249,25 @@ HRESULT Measure::UpdateParent()
 					}
 				}
 
-				// sensivity
+				// sensitivity
 				for (iBand = 0; iBand < m_nBands; iBand++)
 				{
-					m_bandTmpOut[iBand] = max(0, m_sensitivity * log10(CLAMP01(m_bandTmpOut[iBand])) + 1.0);
+					ptrBandBuffer[iBand] = max(0, m_sensitivity * log10(CLAMP01(ptrBandBuffer[iBand])) + 1.0);
 				}
 
 				// smoothing
-				for (iBand = 0; iBand < m_nBands; iBand++)
+				// calculate the average of the band indexes iBand-n to iBand+n (n = m_smoothing)
+				if (m_smoothing)
 				{
-					float x = 0;
-					for (int s = -m_smoothing; s <= m_smoothing; s++)
+					for (iBand = 0; iBand < m_nBands; iBand++)
 					{
-						x += m_bandTmpOut[(iBand + s < 0) || (iBand + s >= m_nBands) ? iBand : iBand + s];
+						float x = 0;
+						for (int s = -m_smoothing; s <= m_smoothing; s++)
+						{
+							x += m_bandTmpOut[(iBand + s < 0) || (iBand + s >= m_nBands) ? iBand : iBand + s];
+						}
+						m_bandOut[iBand] = x * m_smoothingScalar;
 					}
-					m_bandOut[iBand] = x * m_smoothingScalar;
 				}
 			}
 		}
@@ -1287,7 +1376,7 @@ HRESULT	Measure::DeviceInit()
 
 	hr = m_clBugAudio->Initialize(
 		AUDCLNT_SHAREMODE_SHARED,
-		AUDCLNT_STREAMFLAGS_EVENTCALLBACK,		// "Each time the client receives an event for the render stream, it must signal the capture client to run"
+		(m_updCycle == Measure::UPDC_AUDIOLEVEL ? AUDCLNT_STREAMFLAGS_EVENTCALLBACK : 0),		// "Each time the client receives an event for the render stream, it must signal the capture client to run"
 		0,
 		0,
 		m_wfx,
@@ -1298,18 +1387,22 @@ HRESULT	Measure::DeviceInit()
 	}
 	EXIT_ON_ERROR(hr);
 
-	m_hReadyEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
-	if (m_hReadyEvent == NULL)
+	if (m_updCycle == Measure::UPDC_AUDIOLEVEL)
 	{
-		RmLog(LOG_WARNING, L"Failed to create buffer-event handle.");
-		hr = E_FAIL;
-		goto Exit;
+		m_hReadyEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+		if (m_hReadyEvent == NULL)
+		{
+			RmLog(LOG_WARNING, L"Failed to create buffer-event handle.");
+			hr = E_FAIL;
+			goto Exit;
+		}
+
+		m_hStopEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+
+		hr = m_clBugAudio->SetEventHandle(m_hReadyEvent);
+
+		EXIT_ON_ERROR(hr);
 	}
-
-	m_hStopEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
-
-	hr = m_clBugAudio->SetEventHandle(m_hReadyEvent);
-	EXIT_ON_ERROR(hr);
 
 #if (WINDOWS_BUG_WORKAROUND)
 	// ---------------------------------------------------------------------------------------
@@ -1450,6 +1543,8 @@ void Measure::DeviceRelease()
 	if (m_hReadyEvent != NULL) { CloseHandle(m_hReadyEvent); }
 	if (m_hStopEvent != NULL) { CloseHandle(m_hStopEvent); }
 	//if (m_hTask != NULL) { AvRevertMmThreadCharacteristics(m_hTask); }
+
+	delete m_updateLoopThread;
 
 	if (m_fftCfg) kiss_fftr_free(m_fftCfg);
 	m_fftCfg = NULL;
