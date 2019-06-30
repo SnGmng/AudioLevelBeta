@@ -266,12 +266,6 @@ struct Measure
 		m_waveBandOut = NULL;
 		m_waveOut = NULL;
 		m_waveBandTmpOut = NULL;
-
-		for (int iChan = 0; iChan < MAX_CHANNELS; ++iChan)
-		{
-			m_rms[iChan] = 0.0;
-			m_peak[iChan] = 0.0;
-		}
 	}
 
 	HRESULT DeviceInit();
@@ -1065,7 +1059,7 @@ HRESULT Measure::UpdateParent()
 						}
 						else if (iChan == m_channel)
 						{
-							m_ringBuffer[m_ringBufW] = m_bufChunk[iFrame++];
+							m_ringBuffer[m_ringBufW] = m_bufChunk[iFrame];
 						}
 						else { }	// move along the raw data buffer
 
@@ -1080,9 +1074,16 @@ HRESULT Measure::UpdateParent()
 				}
 
 				// rms and peak values for sum channel
-				m_rms[Measure::CHANNEL_SUM] = m_wfx->nChannels >= 2
-					? (m_rms[Measure::CHANNEL_FL] + m_rms[Measure::CHANNEL_FR]) * 0.5f
-					: m_rms[Measure::CHANNEL_FL];
+				if (m_wfx->nChannels >= 2) 
+				{
+					m_rms[Measure::CHANNEL_SUM] = (m_rms[Measure::CHANNEL_FL] + m_rms[Measure::CHANNEL_FR]) * 0.5f;
+					m_peak[Measure::CHANNEL_SUM] = (m_peak[Measure::CHANNEL_FL] + m_peak[Measure::CHANNEL_FR]) * 0.5f;
+				}
+				else 
+				{
+					m_rms[Measure::CHANNEL_SUM] = m_rms[Measure::CHANNEL_FL];
+					m_peak[Measure::CHANNEL_SUM] = m_peak[Measure::CHANNEL_FL];
+				}
 			}
 			else if (m_ringBufferSize) 
 			{
@@ -1128,9 +1129,16 @@ HRESULT Measure::UpdateParent()
 				}
 
 				// rms and peak values for sum channel
-				m_rms[Measure::CHANNEL_SUM] = m_wfx->nChannels >= 2
-					? (m_rms[Measure::CHANNEL_FL] + m_rms[Measure::CHANNEL_FR]) * 0.5f
-					: m_rms[Measure::CHANNEL_FL];
+				if (m_wfx->nChannels >= 2)
+				{
+					m_rms[Measure::CHANNEL_SUM] = (m_rms[Measure::CHANNEL_FL] + m_rms[Measure::CHANNEL_FR]) * 0.5f;
+					m_peak[Measure::CHANNEL_SUM] = (m_peak[Measure::CHANNEL_FL] + m_peak[Measure::CHANNEL_FR]) * 0.5f;
+				}
+				else
+				{
+					m_rms[Measure::CHANNEL_SUM] = m_rms[Measure::CHANNEL_FL];
+					m_peak[Measure::CHANNEL_SUM] = m_peak[Measure::CHANNEL_FL];
+				}
 			}
 		}
 
