@@ -136,6 +136,7 @@ struct Measure
 	int                     m_smoothing;                // smoothing level (parsed from options)
 	int						m_waveSize;					// size of WAVE (parsed from options)
 	int						m_ringBufferSize;			// size of the ring buffer for FFT and WAVE
+	int						m_dynamicVolume;			// enable dynamic volume (parsed from options)
 	UINT32					m_nFramesNext;				// number of frames obtained on the UpdateParent call
 	UINT32					m_nSilentFrames;			// number of silent frames, used to calculate when to stop updating
 	double					m_gainRMS;					// RMS gain (parsed from options)
@@ -213,6 +214,7 @@ struct Measure
 		m_ringBufferSize(0),
 		m_nFramesNext(0),
 		m_nSilentFrames(0),
+		m_dynamicVolume(1),
 		m_gainRMS(1.0),
 		m_gainPeak(1.0),
 		m_freqMin(20.0),
@@ -707,6 +709,9 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 			}
 		}
 
+		// values that dont need fft/band reinitialization
+		m->m_dynamicVolume = max(0, RmReadInt(rm, L"DynamicVolume", m->m_dynamicVolume));
+
 		// (re)parse envelope values
 		m->m_envRMS[0] = max(0, RmReadInt(rm, L"RMSAttack", m->m_envRMS[0]));
 		m->m_envRMS[1] = max(0, RmReadInt(rm, L"RMSDecay", m->m_envRMS[1]));
@@ -740,7 +745,6 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 
 		if (!m->m_updateLoopThread && m->m_updCycle == Measure::UPDC_AUDIOLEVEL)
 		{
-			RmLogF(rm, LOG_DEBUG, L"Creating Thread");
 			// create separate thread with event-driven update loop
 			m->m_updateLoopThread = new std::thread(&Measure::DoCaptureLoop, m);
 			m->m_updateLoopThread->detach();
@@ -1038,7 +1042,7 @@ HRESULT Measure::UpdateParent()
 				m_nSilentFrames = 0;
 			}
 
-			if (m_ringBufferSize && (m_type == Measure::TYPE_RMS || m_type == Measure::TYPE_PEAK))
+			if (m_ringBufferSize && (m_dynamicVolume || m_type == Measure::TYPE_RMS || m_type == Measure::TYPE_PEAK))
 			{
 				// store data in ring buffers, demux streams, and measure RMS and peak levels
 				for (int iFrame = 0; iFrame < nFrames * m_wfx->nChannels;)
@@ -1177,6 +1181,18 @@ HRESULT Measure::UpdateParent()
 
 		if (m_nBands)
 		{
+			// dynamic volume: same band values for low- and high-volume music
+			// if we have silent frames, dont regulate the volume to allow a smooth fading into silence
+			float volumeScalar;
+			if (m_dynamicVolume && m_nSilentFrames <= 0 && m_rms[m_channel] > 0)
+			{
+				volumeScalar = 1 / m_rms[m_channel];
+			}
+			else
+			{
+				volumeScalar = 1;
+			}
+
 			// integrate waveform into lin-scale frequency bands
 			if (m_waveSize)
 			{
@@ -1204,6 +1220,7 @@ HRESULT Measure::UpdateParent()
 					{
 						y += (bLin1 - w0) * (m_waveOut[iBin] * 0.5f + 0.5f);
 						y *= m_waveScalar;
+						y *= volumeScalar;
 						w0 = bLin1;
 						iBand += 1;
 					}
@@ -1252,6 +1269,7 @@ HRESULT Measure::UpdateParent()
 					{
 						y += (fLog1 - f0) * m_fftOut[iBin];
 						y *= m_bandScalar;
+						y *= volumeScalar;
 						f0 = fLog1;
 						iBand += 1;
 					}
