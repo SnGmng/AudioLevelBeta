@@ -1183,14 +1183,12 @@ HRESULT Measure::UpdateParent()
 		{
 			// dynamic volume: same band values for low- and high-volume music
 			// if we have silent frames, dont regulate the volume to allow a smooth fading into silence
-			float volumeScalar;
-			if (m_dynamicVolume && m_nSilentFrames <= 0 && m_rms[m_channel] > 0)
+			float volumeScalar = 1;
+			float volumeScalar2 = 1;
+			if (m_dynamicVolume && m_nSilentFrames <= 0)
 			{
-				volumeScalar = 1 / m_rms[m_channel];
-			}
-			else
-			{
-				volumeScalar = 1;
+				volumeScalar = m_rms[m_channel] > 0 ? 1 / m_rms[m_channel] : 1;
+				volumeScalar2 = m_peak[m_channel] > 0 ? 1 / m_peak[m_channel] : 1;
 			}
 
 			// integrate waveform into lin-scale frequency bands
@@ -1212,15 +1210,15 @@ HRESULT Measure::UpdateParent()
 
 					if (wLin1 < bLin1)
 					{
-						y += (wLin1 - w0) * (m_waveOut[iBin] * 0.5f + 0.5f);
+						y += (wLin1 - w0) * (m_waveOut[iBin]);
 						w0 = wLin1;
 						iBin += 1;
 					}
 					else
 					{
-						y += (bLin1 - w0) * (m_waveOut[iBin] * 0.5f + 0.5f);
-						y *= m_waveScalar;
-						y *= volumeScalar;
+						y += (bLin1 - w0) * (m_waveOut[iBin]);
+						y *= m_waveScalar * volumeScalar2 * 0.5f;
+						y += 0.5f;
 						w0 = bLin1;
 						iBand += 1;
 					}
