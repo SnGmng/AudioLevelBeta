@@ -214,7 +214,7 @@ struct Measure
 		m_ringBufferSize(0),
 		m_nFramesNext(0),
 		m_nSilentFrames(0),
-		m_dynamicVolume(1),
+		m_dynamicVolume(0),
 		m_gainRMS(1.0),
 		m_gainPeak(1.0),
 		m_freqMin(20.0),
@@ -550,20 +550,21 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 	LPCWSTR channel = RmReadString(rm, L"Channel", L"");
 	if (*channel)
 	{
-		int iChan;
-		for (iChan = 0; iChan < Measure::MAX_CHANNELS; ++iChan)
+		bool found = false;
+		for (int iChan = 0; iChan <= Measure::CHANNEL_SUM && !found; ++iChan)
 		{
 			for (int j = 0; j < 3; ++j)
 			{
 				if (_wcsicmp(channel, s_chanName[iChan][j]) == 0)
 				{
 					m->m_channel = (Measure::Channel)iChan;
+					found = true;
 					break;
 				}
 			}
 		}
 
-		if (iChan >= Measure::MAX_CHANNELS)
+		if (!found)
 		{
 			WCHAR msg[512];
 			WCHAR* d = msg;
@@ -1182,13 +1183,13 @@ HRESULT Measure::UpdateParent()
 		if (m_nBands)
 		{
 			// dynamic volume: same band values for low- and high-volume music
-			// if we have silent frames, dont regulate the volume to allow a smooth fading into silence
+			// if there are silent frames in the buffer, dont regulate the volume to allow a smooth fading into silence
 			float volumeScalar = 1;
 			float volumeScalar2 = 1;
 			if (m_dynamicVolume && m_nSilentFrames <= 0)
 			{
-				volumeScalar = m_rms[m_channel] > 0 ? 1 / m_rms[m_channel] : 1;
-				volumeScalar2 = m_peak[m_channel] > 0 ? 1 / m_peak[m_channel] : 1;
+				volumeScalar = m_rms[m_channel] > 0 ? (1 / (min(1, m_rms[m_channel] * 10))) : 1;
+				volumeScalar2 = m_peak[m_channel] > 0 ? 1 / min(1, m_peak[m_channel]) : 1; // WIP
 			}
 
 			// integrate waveform into lin-scale frequency bands
@@ -1266,17 +1267,12 @@ HRESULT Measure::UpdateParent()
 					else
 					{
 						y += (fLog1 - f0) * m_fftOut[iBin];
-						y *= m_bandScalar;
-						y *= volumeScalar;
+						y *= m_bandScalar; // scaling
+						y *= volumeScalar; // dynamic volume
+						y = max(0, m_sensitivity * log10(CLAMP01(y)) + 1.0); // sensitivity
 						f0 = fLog1;
 						iBand += 1;
 					}
-				}
-
-				// sensitivity
-				for (iBand = 0; iBand < m_nBands; iBand++)
-				{
-					ptrBandBuffer[iBand] = max(0, m_sensitivity * log10(CLAMP01(ptrBandBuffer[iBand])) + 1.0);
 				}
 
 				// smoothing
