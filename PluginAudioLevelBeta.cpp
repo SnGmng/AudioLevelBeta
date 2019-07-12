@@ -457,13 +457,13 @@ PLUGIN_EXPORT void Finalize(void* data)
 {
 	Measure* m = (Measure*)data;
 
-	SetEvent(m->m_hStopEvent);
-
-	m->DeviceRelease();
-	SAFE_RELEASE(m->m_enum);
-
 	if (!m->m_parent)
 	{
+		SetEvent(m->m_hStopEvent);
+
+		m->DeviceRelease();
+		SAFE_RELEASE(m->m_enum);
+
 		std::vector<Measure*>::iterator iter = std::find(s_parents.begin(), s_parents.end(), m);
 		s_parents.erase(iter);
 	}
@@ -1168,9 +1168,10 @@ HRESULT Measure::UpdateParent()
 
 				pffft_transform_ordered(m_fftCfg, &m_ringBufOut[m_ringBufferSize - m_fftSize], m_fftTmpOut, NULL, pffft_direction_t::PFFFT_FORWARD);
 
+				int ifftBin;
 				for (int iBin = 0; iBin < m_fftBufferSize; ++iBin)
 				{
-					int ifftBin = iBin * 2;
+					ifftBin = iBin * 2;
 
 					// old and new values
 					float x0 = m_fftOut[iBin];
@@ -1525,8 +1526,6 @@ HRESULT	Measure::DeviceInit()
 	EXIT_ON_ERROR(hr);
 
 	m_bufChunk = (float*)calloc(nMaxFrames * m_wfx->nBlockAlign * sizeof(float), 1);
-
-	RmLog(m_rm, LOG_DEBUG, L"PFFFT AudioLevel loaded!");
 
 	return S_OK;
 
