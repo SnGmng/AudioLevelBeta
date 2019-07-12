@@ -296,7 +296,7 @@ void Measure::DoCaptureLoop()
 	if (!(m_hTask && AvSetMmThreadPriority(m_hTask, AVRT_PRIORITY_CRITICAL)))
 	{
 		DWORD dwErr = GetLastError();
-		RmLog(LOG_WARNING, L"Failed to start multimedia task.");
+		RmLog(m_rm, LOG_WARNING, L"Failed to start multimedia task.");
 		return;
 	}
 
@@ -428,7 +428,7 @@ PLUGIN_EXPORT void Initialize(void** data, void* rm)
 			_snwprintf_s(msg, _TRUNCATE, L"Audio %s device '%s' not found (error 0x%08x).",
 				m->m_port == Measure::PORT_OUTPUT ? L"output" : L"input", m->m_reqID, hr);
 
-			RmLog(LOG_WARNING, msg);
+			RmLog(rm, LOG_WARNING, msg);
 		}
 	}
 	else
@@ -1333,7 +1333,7 @@ HRESULT	Measure::DeviceInit()
 	hr = m_dev->Activate(IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&m_clBugAudio);
 	if (hr != S_OK)
 	{
-		RmLog(LOG_WARNING, L"Failed to create audio client for loopback events.");
+		RmLog(m_rm, LOG_WARNING, L"Failed to create audio client for loopback events.");
 	}
 
 	// get the main audio client
@@ -1341,7 +1341,7 @@ HRESULT	Measure::DeviceInit()
 	//{
 	if (m_dev->Activate(IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&m_clAudio) != S_OK)
 	{
-		RmLog(LOG_WARNING, L"Failed to create audio client.");
+		RmLog(m_rm, LOG_WARNING, L"Failed to create audio client.");
 		goto Exit;
 	}
 	//}
@@ -1390,7 +1390,7 @@ HRESULT	Measure::DeviceInit()
 			}
 			else
 			{
-				RmLog(LOG_WARNING, L"Invalid sample format.  Only PCM 16b integer or PCM 32b float are supported.");
+				RmLog(m_rm, LOG_WARNING, L"Invalid sample format.  Only PCM 16b integer or PCM 32b float are supported.");
 				goto Exit;
 			}
 		}
@@ -1406,7 +1406,7 @@ HRESULT	Measure::DeviceInit()
 		NULL);
 	if (hr != S_OK)
 	{
-		RmLog(LOG_WARNING, L"Failed to initialize audio client for loopback events.");
+		RmLog(m_rm, LOG_WARNING, L"Failed to initialize audio client for loopback events.");
 	}
 	EXIT_ON_ERROR(hr);
 
@@ -1415,7 +1415,7 @@ HRESULT	Measure::DeviceInit()
 		m_hReadyEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
 		if (m_hReadyEvent == NULL)
 		{
-			RmLog(LOG_WARNING, L"Failed to create buffer-event handle.");
+			RmLog(m_rm, LOG_WARNING, L"Failed to create buffer-event handle.");
 			hr = E_FAIL;
 			goto Exit;
 		}
@@ -1453,7 +1453,7 @@ HRESULT	Measure::DeviceInit()
 	hr = m_clBugAudio->Start();
 	if (hr != S_OK)
 	{
-		RmLog(LOG_WARNING, L"Failed to start the stream for loopback events.");
+		RmLog(m_rm, LOG_WARNING, L"Failed to start the stream for loopback events.");
 	}
 	EXIT_ON_ERROR(hr);
 
@@ -1470,7 +1470,7 @@ HRESULT	Measure::DeviceInit()
 
 	if (((IAudioClient3*)m_clAudio)->SetClientProperties(&props) != S_OK)
 	{
-	RmLog(LOG_WARNING, L"Failed to set audio client properties.");
+	RmLog(m_rm, LOG_WARNING, L"Failed to set audio client properties.");
 	goto Exit;
 	}
 
@@ -1483,7 +1483,7 @@ HRESULT	Measure::DeviceInit()
 	, minFrames, m_wfx, NULL);
 	if (hr != S_OK)
 	{
-	RmLog(LOG_WARNING, L"Failed to initialize audio client (3).");
+	RmLog(m_rm LOG_WARNING, L"Failed to initialize audio client (3).");
 	goto Exit;
 	}
 	} else */
@@ -1496,7 +1496,7 @@ HRESULT	Measure::DeviceInit()
 		m_wfx,
 		NULL) != S_OK)
 	{
-		RmLog(LOG_WARNING, L"Failed to initialize loopback audio client.");
+		RmLog(m_rm, LOG_WARNING, L"Failed to initialize loopback audio client.");
 		goto Exit;
 	}
 
@@ -1504,7 +1504,7 @@ HRESULT	Measure::DeviceInit()
 	hr = m_clAudio->GetService(IID_IAudioCaptureClient, (void**)&m_clCapture);
 	if (hr != S_OK)
 	{
-		RmLog(LOG_WARNING, L"Failed to create audio capture client.");
+		RmLog(m_rm, LOG_WARNING, L"Failed to create audio capture client.");
 	}
 	EXIT_ON_ERROR(hr);
 
@@ -1512,7 +1512,7 @@ HRESULT	Measure::DeviceInit()
 	hr = m_clAudio->Start();
 	if (hr != S_OK)
 	{
-		RmLog(LOG_WARNING, L"Failed to start the stream.");
+		RmLog(m_rm, LOG_WARNING, L"Failed to start the stream.");
 	}
 	EXIT_ON_ERROR(hr);
 
@@ -1521,7 +1521,7 @@ HRESULT	Measure::DeviceInit()
 	hr = m_clAudio->GetBufferSize(&nMaxFrames);
 	if (hr != S_OK)
 	{
-		RmLog(LOG_WARNING, L"Failed to determine max buffer size.");
+		RmLog(m_rm, LOG_WARNING, L"Failed to determine max buffer size.");
 	}
 	EXIT_ON_ERROR(hr);
 
@@ -1542,7 +1542,7 @@ Exit:
 void Measure::DeviceRelease()
 {
 
-	RmLog(LOG_DEBUG, L"Releasing dummy stream audio device.");
+	RmLog(m_rm, LOG_DEBUG, L"Releasing dummy stream audio device.");
 	if (m_clBugAudio)
 	{
 		m_clBugAudio->Stop();
@@ -1552,7 +1552,7 @@ void Measure::DeviceRelease()
 #endif
 	SAFE_RELEASE(m_clBugAudio);
 
-	RmLog(LOG_DEBUG, L"Releasing audio device.");
+	RmLog(m_rm, LOG_DEBUG, L"Releasing audio device.");
 
 	if (m_clAudio)
 	{
