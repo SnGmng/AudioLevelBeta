@@ -23,7 +23,7 @@
 
 #include "../../API/RainmeterAPI.h"
 
-#include "kiss_fft130/kiss_fftr.h"
+#include "pffft/pffft.h"
 
 // Overview: Audio level measurement from the Window Core Audio API
 // See: http://msdn.microsoft.com/en-us/library/windows/desktop/dd370800%28v=vs.85%29.aspx
@@ -171,12 +171,12 @@ struct Measure
 	float*					m_bufChunk;					// buffer for latest data chunk copy
 	float					m_rms[MAX_CHANNELS];		// current RMS levels
 	float					m_peak[MAX_CHANNELS];		// current peak levels
-	kiss_fftr_cfg			m_fftCfg;					// FFT states for each channel
+	PFFFT_Setup*			m_fftCfg;					// FFT states for each channel
 	float*					m_ringBuffer;				// ring buffer for audio data
 	float*					m_fftOut;					// buffer for FFT output
 	float*					m_fftKWdw;					// window function coefficients
 	float*					m_ringBufOut;				// buffer for audio data from the ring buffer
-	kiss_fft_cpx*			m_fftTmpOut;				// temp FFT processing buffer
+	float*					m_fftTmpOut;				// temp FFT processing buffer
 	int						m_ringBufW;					// write index for input ring buffers
 	float*					m_bandFreq;					// buffer of band max frequencies
 	float*					m_bandOut;					// buffer of band values
@@ -652,8 +652,8 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 			{
 				m->m_fftKWdw = (float*)calloc(m->m_fftSize * sizeof(float), 1);
 
-				m->m_fftCfg = kiss_fftr_alloc(m->m_fftBufferSize, 0, NULL, NULL);
-				m->m_fftTmpOut = (kiss_fft_cpx*)calloc(m->m_fftBufferSize * sizeof(kiss_fft_cpx), 1);
+				m->m_fftCfg = pffft_new_setup(m->m_fftBufferSize, pffft_transform_t::PFFFT_REAL);
+				m->m_fftTmpOut = (float*)calloc(m->m_fftBufferSize * 2 * sizeof(float), 1);
 
 				m->m_fftOut = (float*)calloc(m->m_fftBufferSize * sizeof(float), 1);
 
@@ -1166,13 +1166,15 @@ HRESULT Measure::UpdateParent()
 				for (int iBin = m_ringBufferSize - m_fftSize; iBin < m_fftSize; ++iBin)
 					m_ringBufOut[iBin] *= m_fftKWdw[iBin];
 
-				kiss_fftr(m_fftCfg, &m_ringBufOut[m_ringBufferSize - m_fftSize], m_fftTmpOut);
+				pffft_transform_ordered(m_fftCfg, &m_ringBufOut[m_ringBufferSize - m_fftSize], m_fftTmpOut, NULL, pffft_direction_t::PFFFT_FORWARD);
 
 				for (int iBin = 0; iBin < m_fftBufferSize; ++iBin)
 				{
+					int ifftBin = iBin * 2;
+
 					// old and new values
 					float x0 = m_fftOut[iBin];
-					const float x1 = (m_fftTmpOut[iBin].r * m_fftTmpOut[iBin].r + m_fftTmpOut[iBin].i * m_fftTmpOut[iBin].i) * m_fftScalar;
+					const float x1 = (m_fftTmpOut[ifftBin] * m_fftTmpOut[ifftBin] + m_fftTmpOut[ifftBin + 1] * m_fftTmpOut[ifftBin + 1]) * m_fftScalar;
 
 					x0 = x1 + m_kFFT[(x1 < x0)] * (x0 - x1);		// attack/decay filter
 					m_fftOut[iBin] = x0;
@@ -1524,6 +1526,8 @@ HRESULT	Measure::DeviceInit()
 
 	m_bufChunk = (float*)calloc(nMaxFrames * m_wfx->nBlockAlign * sizeof(float), 1);
 
+	RmLog(m_rm, LOG_DEBUG, L"PFFFT AudioLevel loaded!");
+
 	return S_OK;
 
 Exit:
@@ -1566,7 +1570,7 @@ void Measure::DeviceRelease()
 
 	delete m_updateLoopThread;
 
-	if (m_fftCfg) kiss_fftr_free(m_fftCfg);
+	if (m_fftCfg) pffft_destroy_setup(m_fftCfg);
 	m_fftCfg = NULL;
 
 	if (m_bufChunk) free(m_bufChunk);
@@ -1613,7 +1617,6 @@ void Measure::DeviceRelease()
 		m_fftTmpOut = NULL;
 		m_ringBufOut = NULL;
 		m_fftKWdw = NULL;
-		kiss_fft_cleanup();
 	}
 
 	m_devName[0] = '\0';
