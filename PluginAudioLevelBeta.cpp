@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <thread>
+#include <chrono>
 #include <avrt.h>
 #pragma comment(lib, "Avrt.lib")
 
@@ -107,12 +108,6 @@ struct Measure
 		NUM_FORMATS
 	};
 
-	enum UpdateCycle
-	{
-		UPDC_RAINMETER,
-		UPDC_AUDIOLEVEL
-	};
-
 	struct BandInfo
 	{
 		float freq;
@@ -123,7 +118,6 @@ struct Measure
 	Channel					m_channel;					// channel specifier (parsed from options)
 	Type					m_type;						// data type specifier (parsed from options)
 	Format					m_format;					// format specifier (detected in init)
-	UpdateCycle				m_updCycle;					// update cycle specifier (parsed from options)
 	int						m_envRMS[2];				// RMS attack/decay times in ms (parsed from options)
 	int						m_envPeak[2];				// peak attack/decay times in ms (parsed from options)
 	int						m_envFFT[2];				// FFT attack/decay times in ms (parsed from options)
@@ -162,6 +156,13 @@ struct Measure
 	HANDLE					m_hStopEvent;				// skin closed handle to receive notifications
 	HANDLE					m_hTask;					// Multimedia Class Scheduler Service task
 	std::thread*			m_updateLoopThread;			// thread for running the update loop
+	std::chrono::system_clock::time_point
+							m_lastUpdate;				// time of last rainmeter update
+	std::chrono::duration<double>
+							m_waitUpdate;				// time to wait between updates
+	std::chrono::duration<double>
+							m_overheadUpdate;			// time that has been waited too long since last update
+	double					m_updatesPerSecond;			// updates per second
 	WCHAR					m_reqID[64];				// requested device ID (parsed from options)
 	WCHAR					m_devName[64];				// device friendly name (detected in init)
 	WCHAR					m_msgUpdate[256];			// rainmeter update command
@@ -196,7 +197,6 @@ struct Measure
 		m_channel(CHANNEL_SUM),
 		m_type(TYPE_RMS),
 		m_format(FMT_INVALID),
-		m_updCycle(UPDC_AUDIOLEVEL),
 		m_fftSize(0),
 		m_fftBufferSize(0),
 		m_fftIdx(-1),
@@ -238,6 +238,8 @@ struct Measure
 		m_hStopEvent(NULL),
 		m_hTask(NULL),
 		m_updateLoopThread(NULL),
+		m_waitUpdate(NULL),
+		m_overheadUpdate(NULL),
 		m_fftKWdw(NULL),
 		m_ringBufOut(NULL),
 		m_fftTmpOut(NULL),
@@ -314,7 +316,31 @@ void Measure::DoCaptureLoop()
 		{
 		case S_OK:
 			// everything is fine, update measures
-			RmExecute(m_skin, m_msgUpdate);
+
+			// wait specified time (to not spam update calls)
+			if (m_updatesPerSecond > 0) 
+			{
+				auto now = std::chrono::system_clock::now();
+				auto elapsed = now - m_lastUpdate;
+				auto waitTime = m_waitUpdate;// - m_overheadUpdate;
+				if (elapsed >= waitTime)
+				{
+					// overheadUpdate should correct the overhead time making the update rate more accurate
+					// but i cant tell the difference and i dont know if it helps or does the opposite
+					// so i leave it disabled until i investigated further
+					//m_overheadUpdate = elapsed - waitTime;
+					//if (m_overheadUpdate > m_waitUpdate) {
+					//	m_overheadUpdate = std::chrono::duration<double>(0);
+					//}
+					m_lastUpdate = now;
+					RmExecute(m_skin, m_msgUpdate);
+				}
+			}
+			// update as fast as possible
+			else if (m_updatesPerSecond < 0 && m_updatesPerSecond >= -1)
+			{
+				RmExecute(m_skin, m_msgUpdate);
+			}
 			break;
 		case S_FALSE:
 			// silence detected, no need to update
@@ -382,27 +408,6 @@ PLUGIN_EXPORT void Initialize(void** data, void* rm)
 		else
 		{
 			RmLogF(rm, LOG_ERROR, L"Invalid Port '%s', must be one of: Output or Input.", port);
-		}
-	}
-
-	// parse update cycle specifier
-	LPCWSTR updCycle = RmReadString(rm, L"UpdateCycle", L"");
-	if (updCycle && *updCycle)
-	{
-		if (_wcsicmp(updCycle, L"Rainmeter") == 0)
-		{
-			// use the update cycle of rainmeter (update when measure update)
-			// for slow PCs
-			m->m_updCycle = Measure::UPDC_RAINMETER;
-		}
-		else if (_wcsicmp(updCycle, L"Audiolevel") == 0)
-		{
-			// use the update cycle of wasapi (update when audio data ready)
-			m->m_updCycle = Measure::UPDC_AUDIOLEVEL;
-		}
-		else
-		{
-			RmLogF(rm, LOG_ERROR, L"Invalid update cycle '%s', must be one of: Rainmeter or Audiolevel.", port);
 		}
 	}
 
@@ -713,6 +718,12 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 		// values that dont need fft/band reinitialization
 		m->m_dynamicVolume = max(0, RmReadInt(rm, L"DynamicVolume", m->m_dynamicVolume));
 
+		// update wait time
+		m->m_updatesPerSecond = min(240, RmReadDouble(rm, L"UpdatesPerSecond", -1));
+		if (m->m_updatesPerSecond > 0) {
+			m->m_waitUpdate = std::chrono::duration<double>(1 / m->m_updatesPerSecond);
+		}
+
 		// (re)parse envelope values
 		m->m_envRMS[0] = max(0, RmReadInt(rm, L"RMSAttack", m->m_envRMS[0]));
 		m->m_envRMS[1] = max(0, RmReadInt(rm, L"RMSDecay", m->m_envRMS[1]));
@@ -744,11 +755,17 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 			}
 		}
 
-		if (!m->m_updateLoopThread && m->m_updCycle == Measure::UPDC_AUDIOLEVEL)
+		if (!m->m_updateLoopThread && m->m_updatesPerSecond != -2)
 		{
 			// create separate thread with event-driven update loop
 			m->m_updateLoopThread = new std::thread(&Measure::DoCaptureLoop, m);
 			m->m_updateLoopThread->detach();
+		}
+		else if (m->m_updateLoopThread && m->m_updatesPerSecond == -2) 
+		{
+			SetEvent(m->m_hStopEvent);
+			//m->m_updateLoopThread->join();
+			//delete m->m_updateLoopThread;
 		}
 	}
 
@@ -784,7 +801,7 @@ PLUGIN_EXPORT double Update(void* data)
 	Measure* parent = m->m_parent ? m->m_parent : m;
 
 
-	if (!m->m_parent && m->m_updCycle == Measure::UPDC_RAINMETER)
+	if (!m->m_parent && m->m_updatesPerSecond == -2)
 	{
 		HRESULT hr = m->UpdateParent();
 
@@ -828,7 +845,7 @@ PLUGIN_EXPORT double Update(void* data)
 	case Measure::TYPE_FFTFREQ:
 		if (parent->m_clCapture && parent->m_fftBufferSize && m->m_fftIdx <= (parent->m_fftBufferSize * 0.5))
 		{
-			return (float)m->m_fftIdx * m->m_df;
+			return ((float)m->m_fftIdx) * m->m_df;
 		}
 		break;
 
@@ -1399,7 +1416,7 @@ HRESULT	Measure::DeviceInit()
 
 	hr = m_clBugAudio->Initialize(
 		AUDCLNT_SHAREMODE_SHARED,
-		(m_updCycle == Measure::UPDC_AUDIOLEVEL ? AUDCLNT_STREAMFLAGS_EVENTCALLBACK : 0),		// "Each time the client receives an event for the render stream, it must signal the capture client to run"
+		(m_updatesPerSecond != -2 ? AUDCLNT_STREAMFLAGS_EVENTCALLBACK : 0),		// "Each time the client receives an event for the render stream, it must signal the capture client to run"
 		0,
 		0,
 		m_wfx,
@@ -1410,7 +1427,7 @@ HRESULT	Measure::DeviceInit()
 	}
 	EXIT_ON_ERROR(hr);
 
-	if (m_updCycle == Measure::UPDC_AUDIOLEVEL)
+	if (m_updatesPerSecond != -2)
 	{
 		m_hReadyEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
 		if (m_hReadyEvent == NULL)
