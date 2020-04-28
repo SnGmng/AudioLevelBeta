@@ -127,7 +127,8 @@ struct Measure
 	int						m_waveIdx;					// WAVE index to retrieve (parsed from options)
 	int						m_nBands;					// number of frequency bands (parsed from options)
 	int						m_bandIdx;					// band index to retrieve (parsed from options)
-	int                     m_smoothing;                // smoothing level (parsed from options)
+	int						m_smoothing;				// smoothing level (parsed from options)
+	int						m_smoothingMode;			// smoothing mode (parsed from options)
 	int						m_waveSize;					// size of WAVE (parsed from options)
 	int						m_ringBufferSize;			// size of the ring buffer for FFT and WAVE
 	int						m_dynamicVolume;			// enable dynamic volume (parsed from options)
@@ -172,6 +173,7 @@ struct Measure
 	float*					m_bufChunk;					// buffer for latest data chunk copy
 	float					m_rms[MAX_CHANNELS];		// current RMS levels
 	float					m_peak[MAX_CHANNELS];		// current peak levels
+	float					m_fftMeanSquare;			// used for dynamic volume
 	PFFFT_Setup*			m_fftCfg;					// FFT states for each channel
 	float*					m_ringBuffer;				// ring buffer for audio data
 	float*					m_fftOut;					// buffer for FFT output
@@ -207,6 +209,7 @@ struct Measure
 		m_df(0),
 		m_dw(0),
 		m_smoothing(0),
+		m_smoothingMode(0),
 		m_smoothingScalar(0),
 		m_waveSize(0),
 		m_waveIdx(0),
@@ -261,6 +264,7 @@ struct Measure
 		m_kPeak[1] = 0.0f;
 		m_kFFT[0] = 0.0f;
 		m_kFFT[1] = 0.0f;
+		m_fftMeanSquare = 0.0f;
 		m_fftCfg = NULL;
 		m_bufChunk = NULL;
 		m_ringBuffer = NULL;
@@ -717,6 +721,7 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 
 		// values that dont need fft/band reinitialization
 		m->m_dynamicVolume = max(0, RmReadInt(rm, L"DynamicVolume", m->m_dynamicVolume));
+		m->m_smoothingMode = min(max(0, RmReadInt(rm, L"SmoothingMode", m->m_smoothingMode)), 2);
 
 		// update wait time
 		m->m_updatesPerSecond = min(240, RmReadDouble(rm, L"UpdatesPerSecond", -1));
@@ -800,7 +805,7 @@ PLUGIN_EXPORT double Update(void* data)
 	Measure* m = (Measure*)data;
 	Measure* parent = m->m_parent ? m->m_parent : m;
 
-
+	// rainmeter style update loop - not recommended
 	if (!m->m_parent && m->m_updatesPerSecond == -2)
 	{
 		HRESULT hr = m->UpdateParent();
@@ -811,8 +816,8 @@ PLUGIN_EXPORT double Update(void* data)
 			// everything is fine, update measures
 			break;
 		case S_FALSE:
-			// silence detected, no need to update
-			return 0.0;
+			// silence detected, but ignore to still update other types of measures like FFTFREQ
+			break;
 		case AUDCLNT_E_BUFFER_ERROR:
 		case AUDCLNT_E_DEVICE_INVALIDATED:
 		case AUDCLNT_E_SERVICE_NOT_RUNNING:
@@ -1028,7 +1033,10 @@ HRESULT Measure::UpdateParent()
 			// release buffer immediately to resume capture
 			m_clCapture->ReleaseBuffer(nFrames);
 
-			// test for discontinuity or silence
+			// first silent check result (to process in the second silent check)
+			bool firstSilentCheckPassed = false;
+
+			// first test for discontinuity or silence (using audioclient flags)
 			if (flags & AUDCLNT_BUFFERFLAGS_SILENT) 
 			{
 				// is the ring buffer filled with silence? then stop updating
@@ -1052,15 +1060,16 @@ HRESULT Measure::UpdateParent()
 			{
 				// not sure what to do with those frames... ignore them? use them? treat as silent frames?
 				// for now, ignore.
-				continue;
+				//continue;
+				firstSilentCheckPassed = true;
 			}
 			else 
 			{
 				// audio data is not silent, reset silent frames counter
-				m_nSilentFrames = 0;
+				firstSilentCheckPassed = true;
 			}
 
-			if (m_ringBufferSize && (m_dynamicVolume || m_type == Measure::TYPE_RMS || m_type == Measure::TYPE_PEAK))
+			if (m_ringBufferSize)
 			{
 				// store data in ring buffers, demux streams, and measure RMS and peak levels
 				for (int iFrame = 0; iFrame < nFrames * m_wfx->nChannels;)
@@ -1094,45 +1103,6 @@ HRESULT Measure::UpdateParent()
 					}
 					m_ringBufW = (m_ringBufW + 1) % m_ringBufferSize;	// move along the data-to-process buffer
 				}
-
-				// rms and peak values for sum channel
-				if (m_wfx->nChannels >= 2) 
-				{
-					m_rms[Measure::CHANNEL_SUM] = (m_rms[Measure::CHANNEL_FL] + m_rms[Measure::CHANNEL_FR]) * 0.5f;
-					m_peak[Measure::CHANNEL_SUM] = (m_peak[Measure::CHANNEL_FL] + m_peak[Measure::CHANNEL_FR]) * 0.5f;
-				}
-				else 
-				{
-					m_rms[Measure::CHANNEL_SUM] = m_rms[Measure::CHANNEL_FL];
-					m_peak[Measure::CHANNEL_SUM] = m_peak[Measure::CHANNEL_FL];
-				}
-			}
-			else if (m_ringBufferSize) 
-			{
-				// store data in ring buffers, and demux streams
-				for (int iFrame = 0; iFrame < nFrames * m_wfx->nChannels;)
-				{
-					for (int iChan = 0; iChan < m_wfx->nChannels; ++iChan)
-					{
-						if (m_channel == Measure::CHANNEL_SUM)
-						{
-							if (iChan == Measure::CHANNEL_FL)
-							{
-								// cannot increment before evaluation
-								const float L = m_bufChunk[iFrame++];
-
-								// stereo to mono: (L + R) / 2
-								m_ringBuffer[m_ringBufW] = 0.5f * (L + m_bufChunk[iFrame++]);
-							}
-						}
-						else if (iChan == m_channel)
-						{
-							m_ringBuffer[m_ringBufW] = m_bufChunk[iFrame++];
-						}
-						else { ++iFrame; }	// move along the raw data buffer
-					}
-					m_ringBufW = (m_ringBufW + 1) % m_ringBufferSize;	// move along the data-to-process buffer
-				}
 			}
 			else if (m_type == Measure::TYPE_RMS || m_type == Measure::TYPE_PEAK) 
 			{
@@ -1149,17 +1119,37 @@ HRESULT Measure::UpdateParent()
 						m_peak[iChan] = absX + m_kPeak[(absX < m_peak[iChan])] * (m_peak[iChan] - absX);
 					}
 				}
+			}
 
-				// rms and peak values for sum channel
-				if (m_wfx->nChannels >= 2)
+			// rms and peak values for sum channel
+			if (m_wfx->nChannels >= 2)
+			{
+				m_rms[Measure::CHANNEL_SUM] = (m_rms[Measure::CHANNEL_FL] + m_rms[Measure::CHANNEL_FR]) * 0.5f;
+				m_peak[Measure::CHANNEL_SUM] = (m_peak[Measure::CHANNEL_FL] + m_peak[Measure::CHANNEL_FR]) * 0.5f;
+			}
+			else
+			{
+				m_rms[Measure::CHANNEL_SUM] = m_rms[Measure::CHANNEL_FL];
+				m_peak[Measure::CHANNEL_SUM] = m_peak[Measure::CHANNEL_FL];
+			}
+
+			if (firstSilentCheckPassed)
+			{
+				// second silent check (using rms)
+				if ((m_rms[Measure::CHANNEL_SUM]) <= 0.0000001F)
 				{
-					m_rms[Measure::CHANNEL_SUM] = (m_rms[Measure::CHANNEL_FL] + m_rms[Measure::CHANNEL_FR]) * 0.5f;
-					m_peak[Measure::CHANNEL_SUM] = (m_peak[Measure::CHANNEL_FL] + m_peak[Measure::CHANNEL_FR]) * 0.5f;
+					if (m_nSilentFrames > m_ringBufferSize)
+					{
+						return S_FALSE;
+					}
+					else 
+					{
+						m_nSilentFrames += nFrames;
+					}
 				}
 				else
 				{
-					m_rms[Measure::CHANNEL_SUM] = m_rms[Measure::CHANNEL_FL];
-					m_peak[Measure::CHANNEL_SUM] = m_peak[Measure::CHANNEL_FL];
+					m_nSilentFrames = 0;
 				}
 			}
 		}
@@ -1179,9 +1169,25 @@ HRESULT Measure::UpdateParent()
 
 			if (m_fftSize)
 			{
-				// apply the windowing function
-				for (int iBin = m_ringBufferSize - m_fftSize; iBin < m_fftSize; ++iBin)
-					m_ringBufOut[iBin] *= m_fftKWdw[iBin];
+				if (m_dynamicVolume) 
+				{
+					// apply the windowing function and calculate fft sized mean square
+					for (int iBin = m_ringBufferSize - m_fftSize; iBin < m_fftSize; ++iBin)
+					{
+						m_fftMeanSquare += m_ringBufOut[iBin] * m_ringBufOut[iBin];
+						m_ringBufOut[iBin] *= m_fftKWdw[iBin];
+					}
+					m_fftMeanSquare = m_fftMeanSquare / m_fftSize;
+					m_fftMeanSquare *= 10.0F;
+				}
+				else 
+				{
+					// apply the windowing function
+					for (int iBin = m_ringBufferSize - m_fftSize; iBin < m_fftSize; ++iBin)
+					{
+						m_ringBufOut[iBin] *= m_fftKWdw[iBin];
+					}
+				}
 
 				pffft_transform_ordered(m_fftCfg, &m_ringBufOut[m_ringBufferSize - m_fftSize], m_fftTmpOut, NULL, pffft_direction_t::PFFFT_FORWARD);
 
@@ -1208,8 +1214,9 @@ HRESULT Measure::UpdateParent()
 			float volumeScalar2 = 1;
 			if (m_dynamicVolume && m_nSilentFrames <= 0)
 			{
-				volumeScalar = m_rms[m_channel] > 0 ? (1 / (min(1, m_rms[m_channel] * 10))) : 1;
-				volumeScalar2 = m_peak[m_channel] > 0 ? 1 / min(1, m_peak[m_channel]) : 1; // WIP
+				//volumeScalar = m_rms[m_channel] > 0 ? (1 / (min(1, m_rms[m_channel] * 10))) : 1;
+				volumeScalar = m_fftMeanSquare > 0 ? (1 / (min(1, m_fftMeanSquare))) : 1;
+				//volumeScalar2 = m_fftMeanSquare > 0 ? 1 / min(1, sqrt(m_fftMeanSquare)) : 1; // WIP
 			}
 
 			// integrate waveform into lin-scale frequency bands
@@ -1254,7 +1261,7 @@ HRESULT Measure::UpdateParent()
 						float x = 0;
 						for (int s = -m_smoothing; s <= m_smoothing; s++)
 						{
-							x += (iBand + s < 0) || (iBand + s >= m_nBands) ? 0.5f : m_waveBandTmpOut[iBand + s];
+							x += (iBand + s < 0) || (iBand + s >= m_nBands) ? 0.5f : ptrWaveBuffer[iBand + s];
 						}
 						m_waveBandOut[iBand] = x * m_smoothingScalar;
 					}
@@ -1264,7 +1271,7 @@ HRESULT Measure::UpdateParent()
 			// integrate FFT results into log-scale frequency bands
 			if (m_fftSize)
 			{
-				int iBin = (int)((m_freqMin / m_df));
+				int iBin = (int)ceilf(m_freqMin / m_df);
 				int iBand = 0;
 				float f0 = m_freqMin;
 
@@ -1299,14 +1306,49 @@ HRESULT Measure::UpdateParent()
 				// calculate the average of the band indexes iBand-n to iBand+n (n = m_smoothing)
 				if (m_smoothing)
 				{
-					for (iBand = 0; iBand < m_nBands; iBand++)
+					// smoothingMode decides what to do at values bigger than nBands or smaller than 0
+					if (m_smoothingMode == 0) 
 					{
-						float x = 0;
-						for (int s = -m_smoothing; s <= m_smoothing; s++)
+						// clamp: 1,2,3 at ends 3,3,3
+						for (iBand = 0; iBand < m_nBands; iBand++)
 						{
-							x += m_bandTmpOut[(iBand + s < 0) || (iBand + s >= m_nBands) ? iBand : iBand + s];
+							float x = 0;
+							for (int s = -m_smoothing; s <= m_smoothing; s++)
+							{
+								x += m_bandTmpOut[(iBand + s < 0) || (iBand + s >= m_nBands) ? iBand : iBand + s];
+							}
+							m_bandOut[iBand] = x * m_smoothingScalar;
 						}
-						m_bandOut[iBand] = x * m_smoothingScalar;
+					}
+					else if (m_smoothingMode == 1)
+					{
+						// repeat: 1,2,3 at ends 1,2,3
+						for (iBand = 0; iBand < m_nBands; iBand++)
+						{
+							float x = 0;
+							for (int s = -m_smoothing; s <= m_smoothing; s++)
+							{
+								int i = iBand + s < 0 ? m_nBands + s : iBand + s;
+								i = i >= m_nBands ? s : i;
+								x += m_bandTmpOut[i];
+							}
+							m_bandOut[iBand] = x * m_smoothingScalar;
+						}
+					}
+					else // if (m_smoothingMode == 2)
+					{
+						// repeat reverse: 1,2,3 at ends: 3,2,1
+						for (iBand = 0; iBand < m_nBands; iBand++)
+						{
+							float x = 0;
+							for (int s = -m_smoothing; s <= m_smoothing; s++)
+							{
+								int i = iBand + s < 0 ? -s : iBand + s;
+								i = i >= m_nBands ? m_nBands - s : i;
+								x += m_bandTmpOut[i];
+							}
+							m_bandOut[iBand] = x * m_smoothingScalar;
+						}
 					}
 				}
 			}
